@@ -1,95 +1,133 @@
-# 🎯 CS2 AI Coach
+# CS2 AI Coach
 
-CS2 demo dosyalarını analiz eden ve Claude AI ile profesyonel coaching raporu üreten uygulama.
+## 1) Project Overview (English)
+CS2 AI Coach is a Streamlit application that analyzes Counter-Strike 2 demo files (`.dem`) and produces:
+- Player performance statistics (K/D, ADR, HS rate, weapon distribution)
+- Rule-based findings
+- Map visualization (death points + utility trajectories)
+- AI coaching report generated with Anthropic Claude
+
+### How it works
+1. Parse demo with `awpy`
+2. Build structured match data (`kills`, `damages`, `grenades`, `rounds`, `players`)
+3. Run player analysis in `src/analyzer.py`
+4. Generate coaching report in `src/coach.py`
+5. Show results in Streamlit (`app.py`)
 
 ---
 
-## Kurulum
+## 2) Proje Açıklaması (Türkçe)
+CS2 AI Coach, Counter-Strike 2 demo dosyalarını (`.dem`) analiz eden bir Streamlit uygulamasıdır. Uygulama:
+- Oyuncu istatistiklerini çıkarır (K/D, ADR, HS oranı, silah dağılımı)
+- Kural tabanlı bulgular üretir
+- Harita üzerinde ölüm noktaları ve utility rotalarını görselleştirir
+- Anthropic Claude ile koçluk raporu oluşturur
 
-### 1. Python 3.11 gereklidir
-```bash
-python --version  # Python 3.11.x çıkmalı
-```
+### Çalışma akışı
+1. Demo `awpy` ile parse edilir
+2. Maç verisi yapılandırılır (`kills`, `damages`, `grenades`, `rounds`, `players`)
+3. `src/analyzer.py` ile oyuncu analizi yapılır
+4. `src/coach.py` ile AI raporu üretilir
+5. Sonuçlar `app.py` üzerinden Streamlit arayüzünde gösterilir
 
-### 2. Sanal ortam oluştur ve aktive et
+---
+
+## 3) Usage (English)
+
+### Requirements
+- Python 3.11
+- Anthropic API key
+
+### Setup
 ```bash
 python -m venv venv
+```
 
-# Windows:
+Windows:
+```bash
 venv\Scripts\activate
+```
 
-# Mac/Linux:
+macOS/Linux:
+```bash
 source venv/bin/activate
 ```
 
-### 3. Kütüphaneleri yükle
+Install dependencies:
 ```bash
 pip install -r requirements.txt
 ```
 
-### 4. API key ayarla
-`.env.example` dosyasını kopyala ve `.env` olarak kaydet:
-```bash
-cp .env.example .env
-```
-Sonra `.env` dosyasını aç ve Anthropic API key'ini yaz:
-```
+Create `.env`:
+```env
 ANTHROPIC_API_KEY=sk-ant-...
 ```
-API key almak için: https://console.anthropic.com
 
-### 5. Demo dosyası ekle
-CS2'den indirdiğin `.dem` dosyasını `demos/` klasörüne koy.
+Put your demo file into `demos/`.
 
----
-
-## Çalıştırma
-
+### Run
 ```bash
 streamlit run app.py
 ```
 
-Tarayıcıda `http://localhost:8501` açılır.
+Open: `http://localhost:8501`
 
 ---
 
-## Proje Yapısı
+## 4) Kullanım (Türkçe)
 
+### Gereksinimler
+- Python 3.11
+- Anthropic API key
+
+### Kurulum
+```bash
+python -m venv venv
 ```
+
+Windows:
+```bash
+venv\Scripts\activate
+```
+
+macOS/Linux:
+```bash
+source venv/bin/activate
+```
+
+Bağımlılıkları yükle:
+```bash
+pip install -r requirements.txt
+```
+
+`.env` dosyasını oluştur:
+```env
+ANTHROPIC_API_KEY=sk-ant-...
+```
+
+Demo dosyanı `demos/` klasörüne koy.
+
+### Çalıştırma
+```bash
+streamlit run app.py
+```
+
+Tarayıcıdan aç: `http://localhost:8501`
+
+---
+
+## 5) Minimal Repository Structure
+```text
 cs2-coach/
-├── demos/          → .dem dosyaları buraya
-├── src/
-│   ├── parser.py   → Demo parse eder
-│   ├── analyzer.py → Kural tabanlı analiz
-│   ├── coach.py    → Claude AI coaching
-│   └── utils.py    → Heatmap ve yardımcı araçlar
-├── outputs/        → Raporlar buraya kaydedilir
-├── app.py          → Streamlit arayüzü
+├── .streamlit/config.toml
+├── De_mirage_radar.webp
+├── README.md
+├── app.py
 ├── requirements.txt
-└── .env            → API key (GitHub'a atma!)
-```
-
----
-
-## CS2'den Demo Nasıl İndirilir?
-
-1. CS2'yi aç
-2. Ana menüden **İzle** → **Maçlarım** sekmesine git
-3. İstediğin maça tıkla → **Demo İndir**
-4. İndirilen `.dem` dosyasını `demos/` klasörüne koy
-
----
-
-## Nasıl Çalışır?
-
-```
-.dem dosyası
-    ↓
-awpy parser → Ham veri (kill, damage, utility, pozisyon)
-    ↓
-analyzer.py → Kural tabanlı bulgular (HS oranı, ADR, utility vb.)
-    ↓
-Claude API → Türkçe coaching raporu
-    ↓
-Streamlit arayüzü → Görsel + rapor
+└── src/
+    ├── __init__.py
+    ├── analyzer.py
+    ├── coach.py
+    ├── parser.py
+    └── utils.py
 ```
