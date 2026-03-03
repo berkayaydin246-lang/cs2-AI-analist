@@ -18,6 +18,7 @@ from src.analyzer import analyze_player
 from src.coach import get_coaching, save_report
 from src.parser import parse_demo
 from src.utils import (
+    create_round_route_gif,
     get_aim_points,
     get_death_positions,
     get_grenade_positions,
@@ -403,6 +404,74 @@ if "analysis" in st.session_state:
 
     with st.expander("Activity Execution Trace", expanded=False):
         st.code("\n".join(activity_trace) if activity_trace else "Trace kaydi yok.", language="text")
+
+    # ── Rota Animasyonu (GIF) ─────────────────────────────────────────────────
+    st.divider()
+    st.subheader("Round Rota Animasyonu")
+
+    has_positions = bool(parsed_data.get("player_positions"))
+    if not has_positions:
+        st.warning(
+            "Movement verisi bulunamadi. Demo'yu yeniden analiz et butonu ile "
+            "tekrar parse etmeni gerekiyor (eski cache guncel format desteklemiyor)."
+        )
+    else:
+        gif_col1, gif_col2, gif_col3 = st.columns([1, 1, 1])
+        with gif_col1:
+            gif_side = st.selectbox(
+                "Taraf filtresi",
+                options=["Tumu", "T-side", "CT-side"],
+                key="gif_side_filter",
+            )
+        with gif_col2:
+            gif_fps_label = st.selectbox(
+                "Animasyon hizi",
+                options=["Yavas (60ms)", "Normal (80ms)", "Hizli (40ms)"],
+                index=1,
+                key="gif_speed",
+            )
+        with gif_col3:
+            gif_fpr = st.slider("Round basina kare sayisi", 8, 20, 12, key="gif_fpr")
+
+        side_map = {"Tumu": None, "T-side": "T", "CT-side": "CT"}
+        speed_map = {"Yavas (60ms)": 60, "Normal (80ms)": 80, "Hizli (40ms)": 40}
+
+        if st.button("Rota GIF Olustur", type="primary", key="btn_gif"):
+            with st.spinner("GIF olusturuluyor... (round sayisina gore 20-60 saniye surebilir)"):
+                try:
+                    gif_path = create_round_route_gif(
+                        parsed_data=parsed_data,
+                        player_name=player,
+                        map_name=analysis["map"],
+                        output_dir="outputs",
+                        output_prefix="route",
+                        frames_per_round=gif_fpr,
+                        frame_duration_ms=speed_map[gif_fps_label],
+                        side_filter=side_map[gif_side],
+                    )
+                    if gif_path:
+                        st.session_state["gif_path"] = gif_path
+                        st.success(f"GIF olusturuldu: {gif_path}")
+                    else:
+                        st.error("GIF olusturulamadi — movement verisi eksik olabilir.")
+                except Exception as e:
+                    st.error(f"GIF hatasi: {e}")
+                    import traceback as tb
+                    st.code(tb.format_exc())
+
+        if "gif_path" in st.session_state and st.session_state["gif_path"]:
+            import pathlib
+            gp = pathlib.Path(st.session_state["gif_path"])
+            if gp.exists():
+                st.image(str(gp), caption=f"Round Rota Animasyonu — {player}", use_container_width=True)
+                with open(gp, "rb") as gf:
+                    st.download_button(
+                        "GIF indir",
+                        data=gf.read(),
+                        file_name=gp.name,
+                        mime="image/gif",
+                        key="download_gif",
+                    )
 
     if "coaching" in st.session_state:
         st.divider()

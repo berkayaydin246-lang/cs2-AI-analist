@@ -29,6 +29,13 @@ def parse_demo(demo_path: str) -> dict:
             return pd.DataFrame()
         if isinstance(val, pd.DataFrame):
             return val
+        # awpy 2.x Polars DataFrame donusumu
+        try:
+            import polars as pl
+            if isinstance(val, pl.DataFrame):
+                return val.to_pandas()
+        except Exception:
+            pass
         try:
             return pd.DataFrame(val)
         except Exception:
@@ -207,7 +214,7 @@ def _process_ticks(df: pd.DataFrame, sample_step: int = 8) -> list:
     sampled["y"] = pd.to_numeric(sampled["y"], errors="coerce")
     sampled = sampled.dropna(subset=["x", "y", "player_name"])
 
-    keep = [c for c in ["player_name", "x", "y", "side", "round_num"] if c in sampled.columns]
+    keep = [c for c in ["player_name", "x", "y", "side", "round_num", "tick"] if c in sampled.columns]
     rows = sampled[keep].to_dict(orient="records")
     print(f"[+] Player positions (sampled): {len(rows)}")
     return rows

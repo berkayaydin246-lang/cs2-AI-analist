@@ -495,6 +495,220 @@ def plot_player_activity_map(
 
     return fig
 
+def create_round_route_gif(
+    parsed_data: dict,
+    player_name: str,
+    map_name: str,
+    output_dir: str = "outputs",
+    output_prefix: str = "route",
+    frames_per_round: int = 14,
+    frame_duration_ms: int = 75,
+    side_filter: str = None,
+) -> str | None:
+    """
+    Oyuncunun her rounddaki hareketini adim adim cizen animasyonlu GIF uretir.
+    Her round icin rota buyuyen bir cizgi olarak gosterilir.
+    side_filter: 'T', 'CT' veya None (hepsi).
+    """
+    import io
+
+    # --- Radar image yukle (heatmap ile ayni oncelik sirasi) ---
+    try:
+        import awpy.data
+        awpy_map_path = awpy.data.MAPS_DIR / f"{map_name}.png"
+    except Exception:
+        awpy_map_path = None
+
+    project_root = Path(__file__).resolve().parent.parent
+    legacy_path = project_root / "De_mirage_radar.webp" if map_name == "de_mirage" else None
+
+    radar_img = None
+    if awpy_map_path and awpy_map_path.exists():
+        radar_img = Image.open(awpy_map_path).convert("RGBA")
+    elif legacy_path and legacy_path.exists():
+        radar_img = Image.open(legacy_path).convert("RGBA")
+
+    GW, GH = 1024, 1024
+    if radar_img and radar_img.size != (GW, GH):
+        radar_img = radar_img.resize((GW, GH), Image.LANCZOS)
+
+    # --- Koordinat donusumu ---
+    map_info = {
+        "de_mirage": {"pos_x": -3230, "pos_y": 1713, "scale": 5.0},
+        "de_dust2":  {"pos_x": -2476, "pos_y": 3239, "scale": 4.4},
+        "de_inferno":{"pos_x": -2087, "pos_y": 3870, "scale": 4.9},
+        "de_nuke":   {"pos_x": -3453, "pos_y": 2887, "scale": 7.0},
+        "de_ancient":{"pos_x": -2953, "pos_y": 2164, "scale": 5.0},
+        "de_anubis": {"pos_x": -2796, "pos_y": 3328, "scale": 5.22},
+        "de_vertigo":{"pos_x": -3168, "pos_y": 1762, "scale": 4.0},
+    }.get(map_name)
+
+    def w2p(x, y):
+        if not map_info:
+            return None, None
+        return (x - map_info["pos_x"]) / map_info["scale"], \
+               (map_info["pos_y"] - y) / map_info["scale"]
+
+    # --- Pozisyonlari round bazinda grupla ---
+    rounds_data: dict[int, list] = {}
+    for p in parsed_data.get("player_positions", []):
+        if p.get("player_name") != player_name:
+            continue
+        rn = p.get("round_num", p.get("round"))
+        if rn is None:
+            continue
+        rn = int(rn)
+        if side_filter:
+            ps = _normalize_side_util(p.get("side", ""))
+            if ps != side_filter:
+                continue
+        try:
+            x, y = float(p["x"]), float(p["y"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        tick = p.get("tick", 0)
+        rounds_data.setdefault(rn, []).append((int(tick), x, y, p.get("side", "")))
+
+    if not rounds_data:
+        print("[!] Round rota verisi bulunamadi — demo yeniden parse edilmeli.")
+        return None
+
+    # Her roundu tick siralamasiyla duzenle
+    for rn in rounds_data:
+        rounds_data[rn].sort(key=lambda t: t[0])
+
+    # --- Olum pozisyonlari ---
+    deaths: dict[int, tuple] = {}
+    for k in parsed_data.get("kills", []):
+        if k.get("victim_name") != player_name:
+            continue
+        rn = k.get("round_num", k.get("round"))
+        if rn is None:
+            continue
+        dx = k.get("victim_x") or k.get("victim_X")
+        dy = k.get("victim_y") or k.get("victim_Y")
+        if dx and dy:
+            try:
+                deaths[int(rn)] = (float(dx), float(dy))
+            except (ValueError, TypeError):
+                pass
+
+    # --- Radar array onceden hazirla (her frame icin tekrar yukleme yapma) ---
+    radar_arr = np.asarray(radar_img) if radar_img else None
+
+    sorted_rounds = sorted(rounds_data.keys())
+    all_frames: list[Image.Image] = []
+    all_durations: list[int] = []
+
+    from matplotlib.collections import LineCollection
+    import matplotlib.cm as mcm
+
+    for rn in sorted_rounds:
+        pos_list = rounds_data[rn]
+        if len(pos_list) < 2:
+            continue
+
+        side_label = _normalize_side_util(pos_list[0][3])
+        death_pos = deaths.get(rn)
+
+        # Animasyon adimlarini belirle: max frames_per_round
+        n = len(pos_list)
+        step_count = min(frames_per_round, n)
+        frame_indices = [int(round(i * (n - 1) / (step_count - 1))) for i in range(step_count)]
+
+        # Tum pozisyonlari piksel uzayina donustur
+        all_px = []
+        for _, gx, gy, _ in pos_list:
+            px, py = w2p(gx, gy)
+            if px is not None:
+                all_px.append((px, py))
+            else:
+                all_px.append(None)
+
+        for frame_i, end_idx in enumerate(frame_indices):
+            fig, ax = plt.subplots(figsize=(5, 5), facecolor="#0e1117")
+            ax.set_facecolor("#0e1117")
+
+            if radar_arr is not None:
+                ax.imshow(radar_arr, extent=[0, GW, GH, 0], aspect="equal")
+
+            # O ana kadar olan rota
+            visible = [p for p in all_px[:end_idx + 1] if p is not None]
+            if len(visible) >= 2:
+                xs = [p[0] for p in visible]
+                ys = [p[1] for p in visible]
+                pts = np.array([xs, ys]).T.reshape(-1, 1, 2)
+                segs = np.concatenate([pts[:-1], pts[1:]], axis=1)
+                n_seg = len(segs)
+                # Renk: baslangic (acik mavi) → bitis (sari/kirmizi)
+                colors = mcm.plasma(np.linspace(0.15, 0.95, n_seg))
+                lc = LineCollection(segs, colors=colors, linewidths=2.2, zorder=5, alpha=0.92)
+                ax.add_collection(lc)
+
+                # Baslangic noktasi
+                ax.scatter(xs[0], ys[0], c="#00ff88", s=70, zorder=7,
+                           edgecolors="white", linewidths=1.2)
+                # Guncel konum
+                ax.scatter(xs[-1], ys[-1], c="#ffdd00", s=90, zorder=8,
+                           edgecolors="white", linewidths=1.2)
+
+            # Son frame: olum isaretcisi
+            if frame_i == len(frame_indices) - 1 and death_pos:
+                dpx, dpy = w2p(death_pos[0], death_pos[1])
+                if dpx is not None:
+                    ax.scatter(dpx, dpy, c="#ff2222", s=200, marker="X",
+                               zorder=9, edgecolors="white", linewidths=1.5)
+
+            ax.set_xlim(0, GW)
+            ax.set_ylim(GH, 0)
+            ax.axis("off")
+            side_color = "#ff8c42" if side_label == "T" else "#42b4ff"
+            ax.set_title(
+                f"Round {rn}  |  {side_label}-side  |  {player_name}",
+                color=side_color, fontsize=10, pad=4,
+                fontweight="bold",
+            )
+
+            buf = io.BytesIO()
+            fig.savefig(buf, format="png", dpi=90, bbox_inches="tight",
+                        facecolor="#0e1117", pad_inches=0.05)
+            plt.close(fig)
+            buf.seek(0)
+            frame_img = Image.open(buf).convert("RGBA").copy()
+            buf.close()
+
+            # Son animasyon karesi daha uzun beklesin
+            dur = frame_duration_ms * 5 if frame_i == len(frame_indices) - 1 else frame_duration_ms
+            all_frames.append(frame_img)
+            all_durations.append(dur)
+
+    if not all_frames:
+        print("[!] GIF icin hicbir kare uretilemedi.")
+        return None
+
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    gif_path = out_dir / f"{output_prefix}_{player_name.replace(' ', '_')}.gif"
+
+    # RGBA -> P (palette) moduna gecis: GIF 256-renk limiti icin gerekli
+    palette_frames = []
+    for f in all_frames:
+        pf = f.convert("RGBA").quantize(colors=256, method=Image.Quantize.FASTOCTREE)
+        palette_frames.append(pf)
+
+    palette_frames[0].save(
+        gif_path,
+        save_all=True,
+        append_images=palette_frames[1:],
+        duration=all_durations,
+        loop=0,
+        optimize=True,
+    )
+
+    print(f"[+] Rota GIF kaydedildi: {gif_path}  ({len(all_frames)} kare)")
+    return str(gif_path)
+
+
 def format_stats_table(stats: dict) -> str:
     """İstatistikleri düzgün bir metin tablosuna çevirir."""
     lines = [
