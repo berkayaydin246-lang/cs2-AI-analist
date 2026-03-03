@@ -38,6 +38,8 @@ def parse_demo(demo_path: str) -> dict:
     damages_df  = _to_df(demo.damages  if hasattr(demo, "damages")  else None)
     rounds_df   = _to_df(demo.rounds   if hasattr(demo, "rounds")   else None)
     grenades_df = _to_df(demo.grenades if hasattr(demo, "grenades") else None)
+    shots_df    = _to_df(demo.shots    if hasattr(demo, "shots")    else None)
+    ticks_df    = _to_df(demo.ticks    if hasattr(demo, "ticks")    else None)
 
     total_rounds = len(rounds_df) if len(rounds_df) > 0 else 0
 
@@ -46,11 +48,15 @@ def parse_demo(demo_path: str) -> dict:
     print(f"[+] Kill sayısı : {len(kills_df)}")
 
     result = {
+        "schema_version": 4,
         "map":          map_name,
         "total_rounds": total_rounds,
+        "map_bounds":   _extract_map_bounds(ticks_df),
         "kills":        _process_kills(kills_df),
         "damages":      _process_damages(damages_df),
         "grenades":     _process_grenades(grenades_df),
+        "shots":        _process_shots(shots_df),
+        "player_positions": _process_ticks(ticks_df),
         "rounds":       _process_rounds(rounds_df),
         "players":      _get_player_list(kills_df),
     }
@@ -81,11 +87,12 @@ def _process_kills(df: pd.DataFrame) -> list:
             32: "tick",
             1:  "victim_x",
             2:  "victim_y",
+            46: "round_num",
         })
 
     keep = [c for c in ["attacker_name", "victim_name", "weapon",
                          "headshot", "attacker_side", "victim_side",
-                         "tick", "victim_x", "victim_y"] if c in df.columns]
+                         "tick", "victim_x", "victim_y", "round_num"] if c in df.columns]
     return df[keep].fillna("").to_dict(orient="records")
 
 
@@ -100,11 +107,136 @@ def _process_damages(df: pd.DataFrame) -> list:
             11: "hp_damage",
             24: "weapon",
             13: "hitgroup",
+            1:  "victim_x",
+            2:  "victim_y",
+            16: "attacker_x",
+            17: "attacker_y",
+            15: "tick",
         })
 
-    keep = [c for c in ["attacker_name", "victim_name", "hp_damage", "weapon", "hitgroup"]
+    keep = [c for c in ["attacker_name", "victim_name", "hp_damage", "weapon", "hitgroup",
+                        "victim_x", "victim_y", "attacker_x", "attacker_y", "tick"]
             if c in df.columns]
     return df[keep].fillna("").to_dict(orient="records")
+
+
+def _process_shots(df: pd.DataFrame) -> list:
+    if df is None or len(df) == 0:
+        return []
+
+    if not isinstance(df.columns[0], str):
+        df = df.rename(columns={
+            3:  "tick",
+            4:  "shot_x",
+            5:  "shot_y",
+            9:  "shooter_name",
+            11: "shooter_side",
+            12: "weapon",
+            13: "round_num",
+        })
+    else:
+        rename_map = {}
+        for col in df.columns:
+            cl = str(col).lower()
+            if cl in ("player_name", "shooter_name", "attacker_name", "name"):
+                rename_map[col] = "shooter_name"
+            elif cl in ("x", "shot_x"):
+                rename_map[col] = "shot_x"
+            elif cl in ("y", "shot_y"):
+                rename_map[col] = "shot_y"
+            elif cl in ("weapon", "weapon_name"):
+                rename_map[col] = "weapon"
+            elif cl in ("tick",):
+                rename_map[col] = "tick"
+            elif cl in ("round", "round_num"):
+                rename_map[col] = "round_num"
+            elif cl in ("side", "shooter_side"):
+                rename_map[col] = "shooter_side"
+        if rename_map:
+            df = df.rename(columns=rename_map)
+
+    keep = [c for c in ["shooter_name", "shooter_side", "weapon",
+                        "tick", "round_num", "shot_x", "shot_y"]
+            if c in df.columns]
+    return df[keep].fillna("").to_dict(orient="records")
+
+
+def _process_ticks(df: pd.DataFrame, sample_step: int = 8) -> list:
+    """Oyuncu hareket verisini hafifletilmiş şekilde çıkarır."""
+    if df is None or len(df) == 0:
+        return []
+
+    if not isinstance(df.columns[0], str):
+        df = df.rename(columns={
+            2: "side",
+            3: "x",
+            4: "y",
+            8: "player_name",
+            9: "round_num",
+        })
+    else:
+        rename_map = {}
+        for col in df.columns:
+            cl = str(col).lower()
+            if cl in ("player_name", "name", "player"):
+                rename_map[col] = "player_name"
+            elif cl in ("x", "player_x"):
+                rename_map[col] = "x"
+            elif cl in ("y", "player_y"):
+                rename_map[col] = "y"
+            elif cl in ("side",):
+                rename_map[col] = "side"
+            elif cl in ("round", "round_num"):
+                rename_map[col] = "round_num"
+        if rename_map:
+            df = df.rename(columns=rename_map)
+
+    needed = {"player_name", "x", "y"}
+    if not needed.issubset(set(df.columns)):
+        print(f"[!] Tick kolonları bulunamadı: {list(df.columns)}")
+        return []
+
+    # Global iloc[::step] kullanmak oyuncu dagilimini bozuyor.
+    # Her oyuncuyu kendi zaman serisinde sample et.
+    step = max(sample_step, 1)
+    sampled_parts = []
+    for _, player_df in df.groupby("player_name", sort=False):
+        sampled_parts.append(player_df.iloc[::step])
+    sampled = pd.concat(sampled_parts, ignore_index=True) if sampled_parts else df.iloc[0:0].copy()
+    sampled["x"] = pd.to_numeric(sampled["x"], errors="coerce")
+    sampled["y"] = pd.to_numeric(sampled["y"], errors="coerce")
+    sampled = sampled.dropna(subset=["x", "y", "player_name"])
+
+    keep = [c for c in ["player_name", "x", "y", "side", "round_num"] if c in sampled.columns]
+    rows = sampled[keep].to_dict(orient="records")
+    print(f"[+] Player positions (sampled): {len(rows)}")
+    return rows
+
+
+def _extract_map_bounds(df: pd.DataFrame) -> dict:
+    """Tick verisinden harita koordinat sınırlarını çıkarır."""
+    if df is None or len(df) == 0:
+        return {}
+
+    x_col = 3 if 3 in df.columns else ("x" if "x" in df.columns else None)
+    y_col = 4 if 4 in df.columns else ("y" if "y" in df.columns else None)
+    if x_col is None or y_col is None:
+        return {}
+
+    tmp = pd.DataFrame({
+        "x": pd.to_numeric(df[x_col], errors="coerce"),
+        "y": pd.to_numeric(df[y_col], errors="coerce"),
+    }).dropna()
+
+    if tmp.empty:
+        return {}
+
+    return {
+        "x_min": float(tmp["x"].min()),
+        "x_max": float(tmp["x"].max()),
+        "y_min": float(tmp["y"].min()),
+        "y_max": float(tmp["y"].max()),
+    }
 
 
 def _normalize_grenade_type(raw_type: str) -> str:

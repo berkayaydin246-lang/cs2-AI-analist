@@ -8,6 +8,8 @@ import json
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.lines import Line2D
+from matplotlib.colors import LinearSegmentedColormap
+import numpy as np
 import pandas as pd
 from pathlib import Path
 from PIL import Image
@@ -84,6 +86,58 @@ def get_grenade_positions(parsed_data: dict, player_name: str) -> list:
     return positions
 
 
+def _normalize_side_util(side_val) -> str:
+    """Side değerini 'T' veya 'CT' olarak normalize eder."""
+    s = str(side_val).strip().lower()
+    if s in ("2", "t", "terrorist"):
+        return "T"
+    if s in ("3", "ct", "counter-terrorist", "counterterrorist"):
+        return "CT"
+    return s.upper()
+
+
+def get_player_movement_positions(parsed_data: dict, player_name: str, side: str = None) -> list:
+    """Oyuncunun maç boyunca geçtiği koordinatları döner. side='T' veya 'CT' ile filtrelenebilir."""
+    points = []
+    for p in parsed_data.get("player_positions", []):
+        if p.get("player_name") != player_name:
+            continue
+        if side is not None:
+            p_side = _normalize_side_util(p.get("side", ""))
+            if p_side != side:
+                continue
+        try:
+            points.append((float(p["x"]), float(p["y"])))
+        except (TypeError, ValueError, KeyError):
+            continue
+    return points
+
+
+def get_aim_points(parsed_data: dict, player_name: str) -> dict:
+    """Aim analizi için shot pozisyonları ve hit noktalarını döner."""
+    shot_points = []
+    for s in parsed_data.get("shots", []):
+        if s.get("shooter_name") != player_name:
+            continue
+        try:
+            shot_points.append((float(s["shot_x"]), float(s["shot_y"])))
+        except (TypeError, ValueError, KeyError):
+            continue
+
+    hit_points = []
+    for d in parsed_data.get("damages", []):
+        if d.get("attacker_name") != player_name:
+            continue
+        x = d.get("victim_x")
+        y = d.get("victim_y")
+        try:
+            hit_points.append((float(x), float(y)))
+        except (TypeError, ValueError):
+            continue
+
+    return {"shot_points": shot_points, "hit_points": hit_points}
+
+
 def plot_death_heatmap(positions: list, map_name: str, player_name: str,
                        grenade_positions: list = None, save_path: str = None):
     if not positions and not grenade_positions:
@@ -117,7 +171,7 @@ def plot_death_heatmap(positions: list, map_name: str, player_name: str,
         "de_mirage": "De_mirage_radar.webp",
     }
     radar_file = radar_map.get(map_name)
-    project_root = Path(__file__).parent.parent
+    project_root = Path(__file__).resolve().parent.parent
     radar_path = project_root / radar_file if radar_file else None
 
     if radar_path and radar_path.exists():
@@ -204,6 +258,242 @@ def plot_death_heatmap(positions: list, map_name: str, player_name: str,
 
     return fig
 
+
+def plot_player_activity_map(
+    movement_positions: list,
+    map_name: str,
+    player_name: str,
+    aim_points: dict = None,
+    save_path: str = None,
+    show_aim_points: bool = False,
+    map_bounds: dict = None,
+    output_dir: str = "outputs",
+    output_prefix: str = "heatmap",
+    title_suffix: str = "",
+):
+    """Build movement heatmap matrix and save both heatmap-only and map overlay outputs."""
+    if not movement_positions:
+        print("[!] Oyuncu movement verisi bulunamadi.")
+        return None
+
+    # Radar dosyasini yukle — oncelik sirasi:
+    #   1. awpy'nin indirdigi RGBA PNG (~/.awpy/maps/<map>.png) — alpha kanali ideal maske saglar
+    #   2. Proje kokündeki eski webp dosyasi (fallback)
+    #   3. Yok ise sadece karanlik arka plan kullanilir
+    try:
+        import awpy.data
+        awpy_map_path = awpy.data.MAPS_DIR / f"{map_name}.png"
+    except Exception:
+        awpy_map_path = None
+
+    project_root = Path(__file__).resolve().parent.parent
+    legacy_radar_file = "De_mirage_radar.webp" if map_name == "de_mirage" else None
+    legacy_radar_path = project_root / legacy_radar_file if legacy_radar_file else None
+
+    grid_w, grid_h = 1024, 1024
+    radar_img = None
+    radar_has_alpha = False
+
+    if awpy_map_path and awpy_map_path.exists():
+        radar_img = Image.open(awpy_map_path).convert("RGBA")
+        radar_has_alpha = True
+        print(f"[+] awpy radar haritasi kullaniliyor: {awpy_map_path.name}")
+    elif legacy_radar_path and legacy_radar_path.exists():
+        radar_img = Image.open(legacy_radar_path).convert("RGBA")
+        radar_has_alpha = False
+        print(f"[+] Proje radar haritasi kullaniliyor: {legacy_radar_path.name}")
+    else:
+        print("[!] Radar haritasi bulunamadi. 'awpy get maps' komutuyla indirebilirsiniz.")
+
+    if radar_img is not None:
+        img_w, img_h = radar_img.size
+        if (img_w, img_h) != (grid_w, grid_h):
+            radar_img = radar_img.resize((grid_w, grid_h), Image.LANCZOS)
+            print(f"[*] Radar {img_w}x{img_h} -> {grid_w}x{grid_h} olceklendi.")
+
+    map_info = {
+        "de_mirage": {"pos_x": -3230, "pos_y": 1713, "scale": 5.0},
+        "de_dust2": {"pos_x": -2476, "pos_y": 3239, "scale": 4.4},
+        "de_inferno": {"pos_x": -2087, "pos_y": 3870, "scale": 4.9},
+        "de_nuke": {"pos_x": -3453, "pos_y": 2887, "scale": 7.0},
+        "de_ancient": {"pos_x": -2953, "pos_y": 2164, "scale": 5.0},
+        "de_anubis": {"pos_x": -2796, "pos_y": 3328, "scale": 5.22},
+        "de_vertigo": {"pos_x": -3168, "pos_y": 1762, "scale": 4.0},
+    }.get(map_name)
+
+    def world_to_pixel(x: float, y: float):
+        if map_info:
+            px = (x - map_info["pos_x"]) / map_info["scale"]
+            py = (map_info["pos_y"] - y) / map_info["scale"]
+            if grid_w != 1024:
+                px = px * (grid_w / 1024.0)
+            if grid_h != 1024:
+                py = py * (grid_h / 1024.0)
+            return px, py
+
+        if isinstance(map_bounds, dict) and {"x_min", "x_max", "y_min", "y_max"}.issubset(map_bounds.keys()):
+            dx = max(map_bounds["x_max"] - map_bounds["x_min"], 1e-9)
+            dy = max(map_bounds["y_max"] - map_bounds["y_min"], 1e-9)
+            px = (x - map_bounds["x_min"]) / dx * grid_w
+            py = (map_bounds["y_max"] - y) / dy * grid_h
+            return px, py
+
+        return None, None
+
+    # 1) Visit count matrix: counts[y, x]
+    counts = np.zeros((grid_h, grid_w), dtype=np.float32)
+    valid_points = 0
+    for x, y in movement_positions:
+        try:
+            px, py = world_to_pixel(float(x), float(y))
+        except (TypeError, ValueError):
+            continue
+        if px is None or py is None:
+            continue
+        ix = int(round(px))
+        iy = int(round(py))
+        if 0 <= ix < grid_w and 0 <= iy < grid_h:
+            counts[iy, ix] += 1.0
+            valid_points += 1
+
+    if valid_points == 0:
+        print("[!] Heatmap icin gecerli pixel noktasi bulunamadi.")
+        return None
+
+    # Gaussian smoothing — sigma büyük olmalı ki harita üzerinde akıcı
+    # ısı dağılımı oluşsun (1024px grid için ~15-18px iyi sonuç verir).
+    sigma = 16.0
+    radius = int(3 * sigma)
+    gy, gx = np.mgrid[-radius : radius + 1, -radius : radius + 1]
+    kernel = np.exp(-(gx**2 + gy**2) / (2.0 * sigma**2))
+    kernel /= max(kernel.sum(), 1e-12)
+
+    out_shape = (
+        counts.shape[0] + kernel.shape[0] - 1,
+        counts.shape[1] + kernel.shape[1] - 1,
+    )
+    f_counts = np.fft.rfftn(counts, s=out_shape)
+    f_kernel = np.fft.rfftn(kernel, s=out_shape)
+    conv_full = np.fft.irfftn(f_counts * f_kernel, s=out_shape)
+    sy = (kernel.shape[0] - 1) // 2
+    sx = (kernel.shape[1] - 1) // 2
+    density = conv_full[sy : sy + grid_h, sx : sx + grid_w]
+    density = np.clip(density, 0.0, None)
+
+    # 2) Normalize — percentile-based clipping ile hotspot dominasyonunu önle.
+    # Spawn gibi aşırı yoğun tek noktalar tüm haritayı soldurmaz.
+    dmax = float(density.max())
+    if dmax > 0:
+        flat = density[density > 0]
+        if len(flat) > 0:
+            clip_val = float(np.percentile(flat, 98))
+            clip_val = max(clip_val, dmax * 0.15)
+            density_clipped = np.clip(density, 0.0, clip_val)
+            density_norm = density_clipped / clip_val
+        else:
+            density_norm = density / dmax
+    else:
+        density_norm = density
+    # FFT kaynaklı çok küçük sayısal artıkları temizle.
+    # Esik düsük tutuldu (0.001) — CT koridorlari gibi seyrek ziyaret edilen
+    # yerler de görünür olsun.
+    density_norm = np.where(density_norm >= 0.001, density_norm, 0.0)
+
+    cmap = LinearSegmentedColormap.from_list(
+        "green_yellow_red",
+        [
+            (0.0, "#00b050"),
+            (0.65, "#ffdd00"),
+            (1.0, "#cc0000"),
+        ],
+    )
+    rgba = cmap(density_norm)
+    # Sabit taban alpha kaldirildi — density=0 olan yerlerde alpha kesinlikle 0.
+    # Bu harita siniri disina hafif Gaussian kuyrugu tasmasini engeller.
+    # Koridorlar gibi dusuk yogunluklu alanlar icin x^0.40 egrisinin
+    # dik baslangici yeterli gorunurluk saglar.
+    alpha = np.where(
+        density_norm > 0,
+        np.clip(0.90 * np.power(density_norm, 0.40), 0.0, 0.92),
+        0.0,
+    )
+
+    from scipy.ndimage import distance_transform_edt, gaussian_filter as gf
+
+    if radar_has_alpha and radar_img is not None:
+        # IDEAL YOL: awpy PNG dosyasinin alpha kanali harita sinirini piksel
+        # hassasiyetinde tanimlar. Harita ici=255, dis alan=0.
+        # Bu yaklasim hem B site hem T spawn gibi karanlik alanlari dogru kapsar.
+        alpha_channel = np.asarray(radar_img)[:, :, 3].astype(np.float32) / 255.0
+        # Kenarlari hafifce yumusat (sert kenar yerine smooth gecis)
+        map_mask = gf(alpha_channel, sigma=3.0)
+        map_mask = np.clip(map_mask, 0.0, 1.0)
+    else:
+        # FALLBACK: Alpha kanali yoksa oyuncu pozisyon verisinden maske uret.
+        # Oyuncunun gercekten bulundugu piksellerden 35px mesafedeki her alan
+        # harita ici sayilir — radar brightness'a bagli degil.
+        visited_binary = counts > 0
+        dist_from_visited = distance_transform_edt(~visited_binary)
+        map_mask = (dist_from_visited <= 35).astype(np.float32)
+        map_mask = gf(map_mask, sigma=6.0)
+        map_mask = np.clip(map_mask, 0.0, 1.0)
+
+    alpha *= map_mask
+
+    rgba[:, :, 3] = alpha
+
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    heatmap_only_path = out_dir / f"{output_prefix}_only.png"
+    heatmap_on_map_path = out_dir / f"{output_prefix}_on_map.png"
+
+    # 3) Heatmap only output
+    fig_only, ax_only = plt.subplots(figsize=(10, 10))
+    ax_only.imshow(rgba, extent=[0, grid_w, grid_h, 0], interpolation="bilinear")
+    ax_only.set_xlim(0, grid_w)
+    ax_only.set_ylim(grid_h, 0)
+    ax_only.axis("off")
+    plt.tight_layout()
+    fig_only.savefig(heatmap_only_path, dpi=150, bbox_inches="tight", pad_inches=0)
+    plt.close(fig_only)
+
+    # 4) Overlay on map
+    fig, ax = plt.subplots(figsize=(10, 10))
+    if radar_img is not None:
+        ax.imshow(radar_img, extent=[0, grid_w, grid_h, 0], aspect="equal")
+    else:
+        ax.set_facecolor("#0e1117")
+        fig.patch.set_facecolor("#0e1117")
+
+    ax.imshow(rgba, extent=[0, grid_w, grid_h, 0], interpolation="bilinear", zorder=4)
+    ax.set_xlim(0, grid_w)
+    ax.set_ylim(grid_h, 0)
+    title_text = f"Heatmap - {player_name} ({map_name})"
+    if title_suffix:
+        title_text += f" — {title_suffix}"
+    ax.set_title(title_text, fontsize=13, color="white")
+    ax.axis("off")
+
+    # Colorbar — yoğunluk skalası
+    from matplotlib.cm import ScalarMappable
+    from matplotlib.colors import Normalize
+    sm = ScalarMappable(cmap=cmap, norm=Normalize(vmin=0, vmax=1))
+    sm.set_array([])
+    cbar = fig.colorbar(sm, ax=ax, fraction=0.046, pad=0.04, shrink=0.8)
+    cbar.set_label("Yogunluk", color="white", fontsize=11)
+    cbar.ax.yaxis.set_tick_params(color="white")
+    cbar.ax.tick_params(labelcolor="white")
+
+    plt.tight_layout()
+    fig.savefig(heatmap_on_map_path, dpi=150, bbox_inches="tight", pad_inches=0)
+
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight", pad_inches=0)
+
+    print(f"[+] Heatmap only saved: {heatmap_only_path}")
+    print(f"[+] Heatmap on map saved: {heatmap_on_map_path}")
+
+    return fig
 
 def format_stats_table(stats: dict) -> str:
     """İstatistikleri düzgün bir metin tablosuna çevirir."""
