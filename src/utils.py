@@ -15,6 +15,50 @@ from pathlib import Path
 from PIL import Image
 
 
+_MAP_INFO = {
+    "de_mirage":  {"pos_x": -3230, "pos_y": 1713,  "scale": 5.0},
+    "de_dust2":   {"pos_x": -2476, "pos_y": 3239,  "scale": 4.4},
+    "de_inferno": {"pos_x": -2087, "pos_y": 3870,  "scale": 4.9},
+    "de_nuke":    {"pos_x": -3453, "pos_y": 2887,  "scale": 7.0},
+    "de_ancient": {"pos_x": -2953, "pos_y": 2164,  "scale": 5.0},
+    "de_anubis":  {"pos_x": -2796, "pos_y": 3328,  "scale": 5.22},
+    "de_vertigo": {"pos_x": -3168, "pos_y": 1762,  "scale": 4.0},
+}
+
+
+def _load_radar_img(map_name: str, grid_size: int = 1024):
+    """Loads radar image: prefers awpy PNG (with alpha), falls back to legacy webp."""
+    try:
+        import awpy.data
+        p = awpy.data.MAPS_DIR / f"{map_name}.png"
+        if p.exists():
+            img = Image.open(p).convert("RGBA")
+            if img.size != (grid_size, grid_size):
+                img = img.resize((grid_size, grid_size), Image.LANCZOS)
+            return img
+    except Exception:
+        pass
+    project_root = Path(__file__).resolve().parent.parent
+    if map_name == "de_mirage":
+        lp = project_root / "De_mirage_radar.webp"
+        if lp.exists():
+            img = Image.open(lp).convert("RGBA")
+            if img.size != (grid_size, grid_size):
+                img = img.resize((grid_size, grid_size), Image.LANCZOS)
+            return img
+    return None
+
+
+def _game_to_pixel(x: float, y: float, map_name: str, grid_size: int = 1024):
+    """Converts game world coordinates to pixel coordinates on the radar image."""
+    info = _MAP_INFO.get(map_name)
+    if not info:
+        return None, None
+    px = (x - info["pos_x"]) / info["scale"]
+    py = (info["pos_y"] - y) / info["scale"]
+    return px, py
+
+
 def list_demos(demo_dir: str = "demos") -> list:
     """demos/ klasöründeki .dem dosyalarını listeler."""
     path = Path(demo_dir)
@@ -256,6 +300,129 @@ def plot_death_heatmap(positions: list, map_name: str, player_name: str,
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches="tight")
 
+    return fig
+
+
+def plot_deaths_map(positions: list, map_name: str, player_name: str, save_path: str = None):
+    """Oyuncunun öldüğü pozisyonları harita üzerinde X işaretleriyle gösterir."""
+    if not positions:
+        print("[!] Ölüm pozisyonu verisi bulunamadı.")
+        return None
+
+    radar_img = _load_radar_img(map_name)
+    fig, ax = plt.subplots(figsize=(8, 8))
+    fig.patch.set_facecolor("#0e1117")
+    if radar_img is not None:
+        ax.imshow(radar_img, extent=[0, 1024, 1024, 0], aspect="equal")
+    else:
+        ax.set_facecolor("#1a1a2e")
+
+    converted = [_game_to_pixel(p[0], p[1], map_name) for p in positions]
+    valid = [(x, y) for x, y in converted if x is not None]
+    if not valid:
+        plt.close(fig)
+        return None
+
+    xs = [p[0] for p in valid]
+    ys = [p[1] for p in valid]
+    ax.scatter(xs, ys, c="#ff2222", s=160, alpha=0.92,
+               edgecolors="white", linewidths=1.5, zorder=5, marker="X")
+    for i, (x, y) in enumerate(zip(xs, ys), 1):
+        ax.annotate(str(i), (x, y), textcoords="offset points",
+                    xytext=(6, 6), fontsize=9, color="white", fontweight="bold", zorder=6)
+
+    ax.set_xlim(0, 1024)
+    ax.set_ylim(1024, 0)
+    ax.set_title(f"Ölüm Pozisyonları — {player_name} ({map_name})  [{len(valid)} ölüm]",
+                 fontsize=12, color="white")
+    legend_handles = [mpatches.Patch(color="#ff2222", label=f"Ölüm ({len(valid)} adet)")]
+    ax.legend(handles=legend_handles, facecolor="#1a1a2e", labelcolor="white", fontsize=9)
+    ax.axis("off")
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    return fig
+
+
+def plot_utility_map(grenade_positions: list, map_name: str, player_name: str, save_path: str = None):
+    """Oyuncunun attığı grenade'leri harita üzerinde türe göre renkli gösterir."""
+    if not grenade_positions:
+        print("[!] Utility pozisyonu verisi bulunamadı.")
+        return None
+
+    GRENADE_COLORS = {
+        "smoke": "#aaaaaa",
+        "flash": "#ffd700",
+        "molotov": "#ff4444",
+        "incendiary": "#ff4444",
+        "he_grenade": "#00cc44",
+        "decoy": "#888888",
+    }
+    GRENADE_LABELS = {
+        "smoke": "Smoke",
+        "flash": "Flash",
+        "molotov": "Molotov",
+        "incendiary": "Incendiary",
+        "he_grenade": "HE",
+        "decoy": "Decoy",
+    }
+
+    radar_img = _load_radar_img(map_name)
+    fig, ax = plt.subplots(figsize=(8, 8))
+    fig.patch.set_facecolor("#0e1117")
+    if radar_img is not None:
+        ax.imshow(radar_img, extent=[0, 1024, 1024, 0], aspect="equal")
+    else:
+        ax.set_facecolor("#1a1a2e")
+
+    grenade_legend_added = set()
+    route_drawn = False
+
+    for gp in grenade_positions:
+        end_x, end_y = _game_to_pixel(gp["x"], gp["y"], map_name)
+        if end_x is None:
+            continue
+        gtype = gp.get("type", "unknown")
+        color = GRENADE_COLORS.get(gtype, "#ffffff")
+
+        path = gp.get("path") or []
+        if len(path) >= 2:
+            pixel_path = [_game_to_pixel(p[0], p[1], map_name) for p in path]
+            pixel_path = [(x, y) for x, y in pixel_path if x is not None]
+            if len(pixel_path) >= 2:
+                pxs = [p[0] for p in pixel_path]
+                pys = [p[1] for p in pixel_path]
+                ax.plot(pxs, pys, color=color, linewidth=2.0, alpha=0.8, zorder=3)
+                route_drawn = True
+        elif gp.get("start_x") is not None and gp.get("start_y") is not None:
+            sx, sy = _game_to_pixel(gp["start_x"], gp["start_y"], map_name)
+            if sx is not None:
+                ax.plot([sx, end_x], [sy, end_y], color=color, linewidth=2.0, alpha=0.75, zorder=3)
+                route_drawn = True
+
+        ax.scatter(end_x, end_y, c=color, s=90, alpha=0.88,
+                   edgecolors="white", linewidths=0.8, zorder=4, marker="o")
+        grenade_legend_added.add(gtype)
+
+    ax.set_xlim(0, 1024)
+    ax.set_ylim(1024, 0)
+    ax.set_title(f"Utility Haritası — {player_name} ({map_name})  [{len(grenade_positions)} atış]",
+                 fontsize=12, color="white")
+
+    legend_handles = []
+    for gtype in grenade_legend_added:
+        color = GRENADE_COLORS.get(gtype, "#ffffff")
+        label = GRENADE_LABELS.get(gtype, gtype)
+        legend_handles.append(mpatches.Patch(color=color, label=label))
+    if route_drawn:
+        legend_handles.append(Line2D([0], [0], color="#ffffff", lw=2, label="Trajectory"))
+    if legend_handles:
+        ax.legend(handles=legend_handles, facecolor="#1a1a2e", labelcolor="white", fontsize=9)
+
+    ax.axis("off")
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
     return fig
 
 

@@ -24,7 +24,8 @@ from src.utils import (
     get_grenade_positions,
     get_player_movement_positions,
     list_demos,
-    plot_death_heatmap,
+    plot_deaths_map,
+    plot_utility_map,
     plot_player_activity_map,
 )
 
@@ -86,7 +87,7 @@ with folder_tab:
 demo_path = st.session_state.get("demo_path")
 
 if demo_path:
-    required_schema_version = 4
+    required_schema_version = 5
     needs_reparse = (
         "parsed_data" not in st.session_state
         or st.session_state.get("loaded_demo") != demo_path
@@ -317,26 +318,41 @@ if "analysis" in st.session_state:
             utility_trace.append(traceback.format_exc())
             st.error("get_grenade_positions calisirken hata olustu.")
 
-        if positions or grenade_pos:
-            try:
-                fig = plot_death_heatmap(
-                    positions or [],
-                    analysis["map"],
-                    analysis["player"],
-                    grenade_positions=grenade_pos,
-                )
-                utility_trace.append("OK plot_death_heatmap")
-                if fig:
-                    st.pyplot(fig)
-                else:
-                    utility_trace.append("WARN plot_death_heatmap -> no fig")
-            except Exception:
-                utility_trace.append("ERR plot_death_heatmap")
-                utility_trace.append(traceback.format_exc())
-                st.error("plot_death_heatmap calisirken hata olustu.")
-        else:
-            utility_trace.append("INFO cizim atlandi: death/grenade verisi yok")
-            st.info("Bu demo icin koordinat verisi mevcut degil.")
+        death_col, util_col = st.columns(2)
+
+        with death_col:
+            st.markdown("##### Olum Pozisyonlari")
+            if positions:
+                try:
+                    fig = plot_deaths_map(positions, analysis["map"], analysis["player"])
+                    utility_trace.append("OK plot_deaths_map")
+                    if fig:
+                        st.pyplot(fig)
+                    else:
+                        st.info("Olum haritasi olusturulamadi.")
+                except Exception:
+                    utility_trace.append("ERR plot_deaths_map")
+                    utility_trace.append(traceback.format_exc())
+                    st.error("plot_deaths_map calisirken hata olustu.")
+            else:
+                st.info("Bu demo icin olum koordinat verisi mevcut degil.")
+
+        with util_col:
+            st.markdown("##### Utility Pozisyonlari")
+            if grenade_pos:
+                try:
+                    fig = plot_utility_map(grenade_pos, analysis["map"], analysis["player"])
+                    utility_trace.append("OK plot_utility_map")
+                    if fig:
+                        st.pyplot(fig)
+                    else:
+                        st.info("Utility haritasi olusturulamadi.")
+                except Exception:
+                    utility_trace.append("ERR plot_utility_map")
+                    utility_trace.append(traceback.format_exc())
+                    st.error("plot_utility_map calisirken hata olustu.")
+            else:
+                st.info("Bu demo icin utility koordinat verisi mevcut degil.")
 
         with st.expander("Utility Execution Trace", expanded=False):
             st.code("\n".join(utility_trace) if utility_trace else "Trace kaydi yok.", language="text")

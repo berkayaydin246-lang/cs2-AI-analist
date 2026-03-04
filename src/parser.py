@@ -55,7 +55,7 @@ def parse_demo(demo_path: str) -> dict:
     print(f"[+] Kill sayısı : {len(kills_df)}")
 
     result = {
-        "schema_version": 4,
+        "schema_version": 5,
         "map":          map_name,
         "total_rounds": total_rounds,
         "map_bounds":   _extract_map_bounds(ticks_df),
@@ -96,6 +96,15 @@ def _process_kills(df: pd.DataFrame) -> list:
             2:  "victim_y",
             46: "round_num",
         })
+
+    else:
+        # awpy Polars uses uppercase X/Y coords — normalize to lowercase
+        coord_rename = {}
+        for col in df.columns:
+            if col == "victim_X":   coord_rename[col] = "victim_x"
+            elif col == "victim_Y": coord_rename[col] = "victim_y"
+        if coord_rename:
+            df = df.rename(columns=coord_rename)
 
     keep = [c for c in ["attacker_name", "victim_name", "weapon",
                          "headshot", "attacker_side", "victim_side",
@@ -299,6 +308,14 @@ def _process_grenades(df: pd.DataFrame) -> list:
                 rename_map[col] = "grenade_type"
             elif cl == "tick":
                 rename_map[col] = "tick"
+            elif cl in ("x", "nade_x"):
+                rename_map[col] = "nade_x"
+            elif cl in ("y", "nade_y"):
+                rename_map[col] = "nade_y"
+            elif cl in ("z", "nade_z"):
+                rename_map[col] = "nade_z"
+            elif cl in ("round", "round_num"):
+                rename_map[col] = "round_num"
         if rename_map:
             df = df.rename(columns=rename_map)
 
