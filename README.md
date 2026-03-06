@@ -1,109 +1,87 @@
 # CS2 AI Coach
 
-> Counter-Strike 2 demo analiz aracı / CS2 demo analysis tool
-> Powered by [awpy](https://github.com/pnxenopoulos/awpy) + [Anthropic Claude](https://anthropic.com)
+Counter-Strike 2 demo analysis tool powered by `awpy` and Anthropic Claude.
 
----
+## Project Overview (EN)
 
-## Table of Contents / İçindekiler
+CS2 AI Coach analyzes a **single .dem file** and provides a full professional-grade web dashboard:
 
-1. [Project Overview (English)](#1-project-overview-english)
-2. [Proje Açıklaması (Türkçe)](#2-proje-açıklaması-türkçe)
-3. [Usage / Kullanım](#3-usage--kullanım)
-4. [Repository Structure](#4-repository-structure)
-5. [Changelog / Sürüm Notları](#5-changelog--sürüm-notları)
+- Individual player analytics with pro metrics
+- Team-level analytics (all 10 players, split scoreboard)
+- Opponent scouting report (AI)
+- Interactive 2D round replay with Canvas renderer
 
----
+## Proje Ozeti (TR)
 
-## 1) Project Overview (English)
+CS2 AI Coach, **tek bir .dem dosyasi** uzerinden profesyonel seviyede web arayuzu sunar:
 
-CS2 AI Coach is a Streamlit application that analyzes Counter-Strike 2 demo files (`.dem`) and produces professional coaching reports powered by Anthropic Claude.
+- Oyuncu bazli analiz ve pro metrikler
+- Takim bazli analiz (10 oyuncu, ayri scoreboard)
+- Rakip scouting raporu (AI)
+- Interaktif 2D round replay (Canvas)
 
-### Features (v0.3 — current)
+## Current Features (v1.0)
 
-**Demo Parsing**
-- Parses `.dem` files via `awpy 2.x` (Polars DataFrame backend)
-- Extracts kills, damages, grenades, shots, player positions, and round data
+### Demo Parsing
+- Parse `.dem` with `awpy 2.x` (Polars DataFrames, named-column aliasing)
+- Extract kills, damages (hp_damage multi-alias), grenades, shots, player positions, rounds, bomb events
 
-**Statistics & Analytics**
-- Basic: K/D, ADR, headshot %, accuracy, weapon breakdown
-- **KAST** (Kill / Assist / Survive / Trade) percentage
-- **T-side vs CT-side** split: separate K/D, kills, deaths, HS% per side
-- **Multi-kill rounds**: 3K, 4K, ACE detection
-- **Trade analysis**: traded-death rate and trade-kill rate (5-second window)
-- **Clutch detection**: 1vX situations with win/loss outcomes
-- **Economy analysis**: eco / force-buy / full-buy round K/D
-- **Flash analysis**: flash assists and self-flash count
-- **Death clustering**: recurring death spots grouped by proximity
-- **Spray transfer detection**: multi-kill sequences within 2 seconds
-- **Round-by-round timeline**: K/D bar chart across all rounds
+### Individual Analysis
+- K/D, ADR, HS%, accuracy, opening duel stats
+- KAST, side split (T/CT), clutches, trades, multi-kills, economy, flash, death clusters
+- Pro metrics: HLTV Rating 2.0 (approx), Impact, Entry Success %, Duel Win Rate, Utility Effectiveness
 
-**Visualizations**
-- **Movement heatmap** (T-side / CT-side split) — Gaussian-smoothed, RGBA PNG masked
-- **Death map** — death positions as numbered X markers on radar
-- **Utility map** — grenade landing spots color-coded by type, with trajectory lines
-- **Round route GIF** — animated route per round with plasma gradient path and death marker
+### Team Analysis
+- 10-player scoreboard split by team (Team 1 vs Team 2)
+- HLTV-style color-coded rating column (green/yellow/red)
+- Match score (rounds won per team)
+- Team aggregate stats: ADR, KAST, Avg Rating, Coordination Score
+- CT setup detection (A/B anchor distribution per round)
+- T execute pattern detection (site preference, kill density)
+- Round auto-tags: pistol, eco, force, full_buy, anti_eco, ace
 
-**AI Coaching**
-- Optional Claude-powered coaching report (requires Anthropic API key)
-- Advanced stats injected into prompt for data-driven, match-specific feedback
+### 2D Replay
+- Canvas-based minimap replay at 600×600px
+- Correct awpy coordinate mapping (world → 1024px radar → 600px canvas)
+- T players (orange) / CT players (blue) with HP bars and yaw arrows
+- Kill markers (X), headshot ring, bomb plant flash, grenade icons
+- Smoke / flash / molotov / HE / decoy event visualization
+- Trail system, player labels, frame scrubber, speed control (0.5×–4×)
+- Kill feed and alive panel in sidebar
 
-### How It Works
-1. Parse demo with `awpy` → structured JSON
-2. Run player analysis (basic + advanced) in `src/analyzer.py`
-3. Generate coaching report in `src/coach.py` (Claude Opus 4.6) — optional
-4. Display results in Streamlit (`app.py`)
+### AI Reports
+- Individual coaching report (`get_coaching`) — Turkish output, Claude Sonnet 4.6
+- Opponent scouting report (`get_scouting_report`) — tendencies, weak spots, counter-strategies
 
----
+## Architecture
 
-## 2) Proje Açıklaması (Türkçe)
+This project uses a **FastAPI** backend + **vanilla JS SPA** frontend (no frameworks):
 
-CS2 AI Coach, Counter-Strike 2 demo dosyalarını analiz eden ve Anthropic Claude ile profesyonel koçluk raporu üreten bir Streamlit uygulamasıdır.
+```
+cs2-coach/
+├── api/
+│   ├── __init__.py
+│   └── main.py          # FastAPI endpoints, in-memory session store
+├── frontend/
+│   ├── index.html       # Single-page app shell
+│   ├── css/style.css
+│   └── js/
+│       ├── api.js       # Thin fetch wrapper
+│       ├── replay.js    # ReplayEngine (Canvas 2D)
+│       └── app.js       # SPA navigation, view rendering
+├── src/
+│   ├── analyzer.py      # Player analysis, pro metrics
+│   ├── coach.py         # Claude AI coaching & scouting
+│   ├── parser.py        # awpy 2.x demo parsing
+│   ├── team_analyzer.py # Team scoreboard, setups, executes, tags
+│   ├── replay.py        # (legacy Plotly replay helper)
+│   └── utils.py         # Map info, coordinate helpers
+├── app.py               # (legacy Streamlit app)
+├── requirements.txt
+└── README.md
+```
 
-### Özellikler (v0.3 — güncel)
-
-**Demo Parsing**
-- `.dem` dosyaları `awpy 2.x` ile parse edilir (Polars DataFrame backend)
-- Kill, hasar, grenade, atış, oyuncu pozisyonu ve round verisi çıkarılır
-
-**İstatistik ve Analiz**
-- Temel: K/D, ADR, headshot %, isabet oranı, silah dağılımı
-- **KAST** (Kill / Assist / Survive / Trade) yüzdesi
-- **T-side / CT-side ayrımı**: taraf bazlı K/D, kill, death, HS%
-- **Multi-kill roundlar**: 3K, 4K ve ACE tespiti
-- **Trade analizi**: trade edilme oranı ve trade kill oranı (5 saniyelik pencere)
-- **Clutch tespiti**: 1vX durumları ve kazanma/kaybetme sonuçları
-- **Ekonomi analizi**: eco / force-buy / full-buy round bazlı K/D
-- **Flash analizi**: flash asist ve self-flash sayısı
-- **Ölüm kümeleme**: tekrarlayan ölüm noktaları mesafe bazlı gruplandırılır
-- **Spray transfer tespiti**: 2 saniye içinde ardışık kill dizileri
-- **Round zaman çizelgesi**: tüm roundlar boyunca K/D bar grafiği
-
-**Görselleştirme**
-- **Hareket ısı haritası** (T-side / CT-side ayrımı) — Gaussian düzleştirme, RGBA PNG maskesi
-- **Ölüm haritası** — ölüm pozisyonları numaralı X işaretleriyle radar üzerinde
-- **Utility haritası** — grenade iniş noktaları türe göre renkli, trajectory çizgileriyle
-- **Round rota GIF** — her round için plasma gradyanlı animasyonlu rota + ölüm işaretçisi
-
-**AI Koçluk**
-- İsteğe bağlı Claude koçluk raporu (Anthropic API key gerektirir)
-- Gelişmiş istatistikler Claude promptuna enjekte edilir — maça özel geri bildirim
-
-### Çalışma Akışı
-1. Demo `awpy` ile parse edilir → yapılandırılmış JSON
-2. `src/analyzer.py` ile temel + gelişmiş oyuncu analizi
-3. `src/coach.py` ile AI raporu üretilir (Claude Opus 4.6) — isteğe bağlı
-4. Sonuçlar `app.py` üzerinden Streamlit arayüzünde gösterilir
-
----
-
-## 3) Usage / Kullanım
-
-### Requirements / Gereksinimler
-- Python 3.11+
-- Anthropic API key (AI coaching için / for AI coaching — optional)
-
-### Setup / Kurulum
+## Setup
 
 ```bash
 python -m venv venv
@@ -119,138 +97,69 @@ macOS/Linux:
 source venv/bin/activate
 ```
 
-Install dependencies / Bağımlılıkları yükle:
+Install dependencies:
 ```bash
 pip install -r requirements.txt
 ```
 
-Download map radar files / Harita radar dosyalarını indir (heatmap için gerekli):
+Download map radar images:
 ```bash
 awpy get maps
 ```
 
-Create `.env` / `.env` oluştur:
+Create `.env`:
 ```env
 ANTHROPIC_API_KEY=sk-ant-...
 ```
 
-Put your demo file into `demos/` / Demo dosyanı `demos/` klasörüne koy.
-
-### Run / Çalıştır
-
+Run the web server:
 ```bash
-streamlit run app.py
+uvicorn api.main:app --reload --port 8000
 ```
 
-Open / Aç: `http://localhost:8501`
+Then open [http://localhost:8000](http://localhost:8000).
 
----
+## API Endpoints
 
-## 4) Repository Structure
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/api/demo/upload` | Upload `.dem` file |
+| POST | `/api/demo/{id}/parse` | Parse demo, extract all data |
+| GET  | `/api/demo/{id}/info` | Demo metadata + player list |
+| GET  | `/api/radar/{map_name}` | Radar image (PNG/WebP) |
+| POST | `/api/demo/{id}/analyze/{player}` | Individual player analysis |
+| GET  | `/api/demo/{id}/team` | Full team analysis |
+| GET  | `/api/demo/{id}/replay/rounds` | Available round numbers |
+| GET  | `/api/demo/{id}/replay/{round}` | Replay frames + kills + bombs + grenades |
+| POST | `/api/demo/{id}/coaching/{player}` | AI coaching report |
+| POST | `/api/demo/{id}/scouting/{team}` | AI scouting report |
 
-```text
-cs2-coach/
-├── .streamlit/
-│   └── config.toml
-├── demos/               # Place .dem files here / .dem dosyaları buraya
-├── outputs/             # Generated reports & visuals / Üretilen raporlar ve görseller
-├── README.md
-├── app.py               # Streamlit UI
-├── requirements.txt
-└── src/
-    ├── __init__.py
-    ├── analyzer.py      # Basic + advanced player analysis
-    ├── coach.py         # Claude API coaching report generation
-    ├── parser.py        # awpy demo parser (Polars-compatible)
-    └── utils.py         # Heatmap, death map, utility map, GIF, coordinate helpers
-```
+## Changelog
 
-> Map radar images are downloaded by `awpy get maps` to `~/.awpy/maps/` — no need to copy them into the project directory.
-> Harita radar görselleri `awpy get maps` ile `~/.awpy/maps/` dizinine indirilir, proje dizinine kopyalanması gerekmez.
+### v1.0
+- **New**: FastAPI backend + vanilla JS SPA replaces Streamlit
+- **New**: `api/main.py` — REST API with in-memory session store, side normalization, zero-coord filtering, grenade events in replay response
+- **New**: `frontend/` — dark-themed SPA with upload flow, overview, player, team, replay and coaching views
+- **New**: Canvas 2D replay engine (`replay.js`) — correct world→radar→canvas coordinate mapping, grenade/bomb/kill events
+- **New**: `src/team_analyzer.py` — scoreboard, CT setups, T executes, coordination score, round tags, match score
+- **New**: HLTV Rating 2.0 approx, Impact, Duel Win Rate, Entry Success, Utility Score (`src/analyzer.py`)
+- **New**: `get_scouting_report()` in `src/coach.py`
+- **Fix**: `_process_damages` column aliasing — handles `hp_damage`, `hp_dmg`, `damage_health`, `damage_health_real`, etc. (ADR = 0.0 bug)
+- **Fix**: Rating color CSS specificity — `.data-table td.rating-*` overrides table cell default color
+- **Fix**: Match score computed from `winner_side` + team side mapping
 
----
+### v0.3
+- Fixed `victim_X` / `victim_Y` normalization bug
+- Fixed grenade `X/Y/Z` mapping to `nade_x/y/z`
+- Added separate death map and utility map
+- Schema version bumped to 5
 
-## 5) Changelog / Sürüm Notları
+### v0.2.1
+- Added round route GIF animation
 
-### v0.3 — Death & Utility Maps + Parser Fix
-**EN**
-- Fixed critical bug: `victim_X`/`victim_Y` (awpy Polars uppercase columns) were silently dropped, causing empty death maps — now correctly normalized
-- Fixed grenade coordinate extraction: `X`/`Y`/`Z` columns now mapped to `nade_x`/`nade_y`/`nade_z`
-- **Death map**: death positions displayed as numbered red X markers on radar (separate from utility)
-- **Utility map**: grenade landing spots color-coded by type (smoke/flash/HE/molotov/decoy) with trajectory lines — separate map
-- Schema version bumped to 5 (triggers automatic re-parse of cached demos)
-- Shared helpers added to `utils.py`: `_MAP_INFO`, `_load_radar_img`, `_game_to_pixel`
+### v0.2
+- Added advanced analytics (KAST, clutch, trade, economy, flash, multi-kill, clusters)
+- Added T/CT heatmap split
 
-**TR**
-- Kritik hata düzeltildi: `victim_X`/`victim_Y` (awpy Polars büyük harf kolonlar) sessizce düşürülüyordu, ölüm haritaları boş geliyordu — artık doğru normalize ediliyor
-- Grenade koordinat çıkarımı düzeltildi: `X`/`Y`/`Z` kolonları artık `nade_x`/`nade_y`/`nade_z`'ye doğru eşleniyor
-- **Ölüm haritası**: ölüm pozisyonları numaralı kırmızı X işaretleriyle radar üzerinde gösteriliyor (utility'den ayrı)
-- **Utility haritası**: grenade iniş noktaları türe göre renkli (smoke/flash/HE/molotov/decoy) + trajectory çizgileri — ayrı harita
-- Schema versiyonu 5'e yükseltildi (önbelleğe alınmış demolar otomatik yeniden parse edilir)
-
----
-
-### v0.2.1 — Round Route Animation GIF
-**EN**
-- Animated GIF showing player route for each round on the radar map
-- Plasma gradient colored path (start → end), growing frame by frame
-- Death position marked with red X on the final frame
-- Side filter (T / CT / All) and speed/frame controls in the UI
-- GIF download button
-
-**TR**
-- Her round için oyuncunun rotasını radar harita üzerinde gösteren animasyonlu GIF
-- Plasma gradyanlı renkli rota (başlangıç → bitiş), kare kare büyüyerek çizilir
-- Son karede kırmızı X ile ölüm pozisyonu gösterilir
-- Arayüzde taraf filtresi (T / CT / Tümü) ve hız/kare kontrolü
-- GIF indirme butonu
-
----
-
-### v0.2 — Advanced Analytics + T/CT Heatmap Split
-**EN**
-- **KAST** metric (Kill / Assist / Survive / Trade percentage)
-- **T-side vs CT-side** split stats: separate K/D, kills, deaths, HS% per side
-- **Multi-kill detection**: 3K, 4K, ACE rounds
-- **Trade analysis**: traded-death rate and trade-kill rate (5-second window)
-- **Clutch detection**: 1vX situations with outcomes
-- **Economy analysis**: K/D breakdown for eco / force-buy / full-buy rounds
-- **Flash analysis**: flash assists and self-flash tracking
-- **Death clustering**: recurring death spots grouped by proximity
-- **Spray transfer detection**: rapid multi-kills within 2-second window
-- **Round timeline**: K/D bar chart per round
-- Movement heatmap split into T-side and CT-side maps
-- awpy RGBA PNG used as pixel-accurate map mask (fixes B site / T-spawn masking)
-- Advanced stats injected into Claude coaching prompt
-
-**TR**
-- **KAST** metriği (Kill / Assist / Survive / Trade yüzdesi)
-- **T-side / CT-side ayrımı**: taraf bazlı K/D, kill, death, HS%
-- **Multi-kill tespiti**: 3K, 4K, ACE roundlar
-- **Trade analizi**: trade edilme ve trade kill oranları (5 saniyelik pencere)
-- **Clutch tespiti**: 1vX durumları ve sonuçları
-- **Ekonomi analizi**: eco / force-buy / full-buy round bazlı K/D
-- **Flash analizi**: flash asist ve self-flash takibi
-- **Ölüm kümeleme**: tekrarlayan ölüm noktaları mesafe bazlı gruplandırma
-- **Spray transfer tespiti**: 2 saniye içinde ardışık kill dizileri
-- **Round zaman çizelgesi**: round başına K/D bar grafiği
-- Hareket ısı haritası T-side ve CT-side olarak iki ayrı haritaya bölündü
-- awpy RGBA PNG ile piksel hassasiyetinde harita maskesi (B site ve T spawn dahil)
-- Gelişmiş istatistikler Claude koçluk promptuna eklendi
-
----
-
-### v0.1 — Initial Release
-**EN**
-- Parse CS2 demo files via `awpy`
-- Basic player stats: K/D, ADR, headshot %, accuracy, weapon kill breakdown
-- Rule-based findings (low K/D, poor accuracy, etc.)
-- Optional Claude AI coaching report
-- Streamlit UI with demo file upload and player selector
-
-**TR**
-- `awpy` ile CS2 demo dosyası parse etme
-- Temel oyuncu istatistikleri: K/D, ADR, headshot %, isabet oranı, silah kill dağılımı
-- Kural tabanlı bulgular (düşük K/D, zayıf isabet vb.)
-- İsteğe bağlı Claude AI koçluk raporu
-- Demo yükleme ve oyuncu seçimi içeren Streamlit arayüzü
+### v0.1
+- Initial release: parsing, basic stats, rule-based findings, AI coaching

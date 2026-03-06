@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CS2 AI Coach</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/css/style.css" />
+</head>
+<body>
+<div id="app">
+
+  <!-- ── Sidebar ─────────────────────────────────────────────────────────── -->
+  <aside id="sidebar">
+    <div class="sidebar-logo">
+      <span class="logo-icon">⬡</span>
+      <span class="logo-text">CS2 Coach</span>
+    </div>
+
+    <div id="demo-meta" class="demo-meta hidden">
+      <div class="demo-meta-filename" id="meta-filename">—</div>
+      <div class="demo-meta-row">
+        <span class="badge badge-map" id="meta-map">—</span>
+        <span class="badge badge-rounds" id="meta-rounds">— rounds</span>
+      </div>
+    </div>
+
+    <nav id="main-nav">
+      <a class="nav-item active" data-view="upload" href="#">
+        <span class="nav-icon">⬆</span><span class="nav-label">Upload</span>
+      </a>
+      <a class="nav-item" data-view="overview" href="#">
+        <span class="nav-icon">◧</span><span class="nav-label">Overview</span>
+      </a>
+      <a class="nav-item" data-view="player" href="#">
+        <span class="nav-icon">◉</span><span class="nav-label">Player</span>
+      </a>
+      <a class="nav-item" data-view="team" href="#">
+        <span class="nav-icon">⧉</span><span class="nav-label">Team</span>
+      </a>
+      <a class="nav-item" data-view="replay" href="#">
+        <span class="nav-icon">▶</span><span class="nav-label">2D Replay</span>
+      </a>
+      <a class="nav-item" data-view="coaching" href="#">
+        <span class="nav-icon">⚡</span><span class="nav-label">AI Coach</span>
+      </a>
+    </nav>
+
+    <div class="sidebar-footer">
+      <span class="version-badge">v1.0</span>
+    </div>
+  </aside>
+
+  <!-- ── Main content ───────────────────────────────────────────────────── -->
+  <main id="main">
+
+    <!-- ── UPLOAD VIEW ───────────────────────────────────────────────────── -->
+    <div class="view active" id="view-upload">
+      <div class="view-header">
+        <h1>Upload Demo</h1>
+        <p class="view-subtitle">Drag &amp; drop a CS2 .dem file to begin analysis</p>
+      </div>
+
+      <div class="upload-zone" id="upload-zone">
+        <div class="upload-zone-inner">
+          <div class="upload-icon">⬆</div>
+          <p class="upload-label">Drop your <strong>.dem</strong> file here</p>
+          <p class="upload-sub">or click to browse</p>
+          <input type="file" id="file-input" accept=".dem" hidden />
+          <button class="btn btn-primary" id="btn-browse">Browse File</button>
+        </div>
+      </div>
+
+      <div id="upload-progress" class="upload-progress hidden">
+        <div class="progress-steps">
+          <div class="progress-step" id="step-upload">
+            <span class="step-dot"></span>
+            <span class="step-label">Uploading</span>
+          </div>
+          <div class="progress-connector"></div>
+          <div class="progress-step" id="step-parse">
+            <span class="step-dot"></span>
+            <span class="step-label">Parsing</span>
+          </div>
+          <div class="progress-connector"></div>
+          <div class="progress-step" id="step-ready">
+            <span class="step-dot"></span>
+            <span class="step-label">Ready</span>
+          </div>
+        </div>
+        <div id="upload-status-msg" class="upload-status-msg"></div>
+      </div>
+    </div>
+
+    <!-- ── OVERVIEW VIEW ─────────────────────────────────────────────────── -->
+    <div class="view" id="view-overview">
+      <div class="view-header">
+        <h1>Overview</h1>
+        <p class="view-subtitle" id="overview-subtitle">Demo loaded</p>
+      </div>
+      <div id="overview-body"></div>
+    </div>
+
+    <!-- ── PLAYER VIEW ───────────────────────────────────────────────────── -->
+    <div class="view" id="view-player">
+      <div class="view-header">
+        <h1>Player Analysis</h1>
+      </div>
+      <div class="player-controls">
+        <select id="player-select" class="select"></select>
+        <button class="btn btn-primary" id="btn-analyze">Analyze</button>
+        <span id="player-analyze-status" class="status-text"></span>
+      </div>
+      <div id="player-body"></div>
+    </div>
+
+    <!-- ── TEAM VIEW ─────────────────────────────────────────────────────── -->
+    <div class="view" id="view-team">
+      <div class="view-header">
+        <h1>Team Analysis</h1>
+        <p class="view-subtitle">All 10 players — CT setup patterns — T execute detection</p>
+      </div>
+      <div id="team-body"></div>
+    </div>
+
+    <!-- ── REPLAY VIEW ───────────────────────────────────────────────────── -->
+    <div class="view" id="view-replay">
+      <div class="view-header">
+        <h1>2D Replay</h1>
+        <p class="view-subtitle">Frame-by-frame tactical minimap</p>
+      </div>
+
+      <div class="replay-layout">
+        <!-- Canvas + controls -->
+        <div class="replay-main">
+          <div class="replay-canvas-wrapper">
+            <canvas id="replay-canvas" width="600" height="600"></canvas>
+            <div id="replay-loading-overlay" class="replay-loading hidden">
+              <div class="spinner"></div>
+              <span>Loading round data…</span>
+            </div>
+          </div>
+
+          <!-- Round pills -->
+          <div class="round-pills-bar" id="round-pills-bar">
+            <span class="round-pills-label">Round</span>
+            <div id="round-pills" class="round-pills"></div>
+          </div>
+
+          <!-- Controls bar -->
+          <div class="replay-controls-bar">
+            <button class="replay-btn" id="rp-prev-frame" title="Prev frame">&#8249;</button>
+            <button class="replay-btn replay-btn-play" id="rp-play" title="Play/Pause">&#9654;</button>
+            <button class="replay-btn" id="rp-next-frame" title="Next frame">&#8250;</button>
+            <div class="scrubber-wrap">
+              <input type="range" id="rp-scrubber" class="scrubber" min="0" max="100" value="0" />
+            </div>
+            <span class="replay-frame-counter" id="rp-frame-counter">0 / 0</span>
+            <select id="rp-speed" class="replay-select">
+              <option value="0.5">0.5x</option>
+              <option value="1" selected>1x</option>
+              <option value="2">2x</option>
+              <option value="4">4x</option>
+            </select>
+            <label class="replay-toggle-label">
+              <input type="checkbox" id="rp-trails" checked /> Trails
+            </label>
+            <label class="replay-toggle-label">
+              <input type="checkbox" id="rp-labels" checked /> Labels
+            </label>
+          </div>
+        </div>
+
+        <!-- Sidebar panels -->
+        <div class="replay-sidebar-panel">
+          <div class="panel-block">
+            <div class="panel-title">Players</div>
+            <div id="alive-panel" class="alive-panel"></div>
+          </div>
+          <div class="panel-block">
+            <div class="panel-title">Kill Feed</div>
+            <div id="kill-feed" class="kill-feed"></div>
+          </div>
+          <div class="panel-block">
+            <div class="panel-title">Round Tags</div>
+            <div id="round-tags-display" class="round-tags-display">—</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── COACHING VIEW ─────────────────────────────────────────────────── -->
+    <div class="view" id="view-coaching">
+      <div class="view-header">
+        <h1>AI Coach</h1>
+        <p class="view-subtitle">Claude-powered analysis — individual coaching + team scouting</p>
+      </div>
+
+      <div class="coaching-controls">
+        <div class="coaching-tabs">
+          <button class="tab-btn active" data-tab="individual">Individual</button>
+          <button class="tab-btn" data-tab="scouting">Team Scouting</button>
+        </div>
+      </div>
+
+      <div id="coaching-individual" class="coaching-section">
+        <div class="coaching-row">
+          <select id="coaching-player-select" class="select"></select>
+          <button class="btn btn-primary" id="btn-get-coaching">Generate Report</button>
+          <span id="coaching-status" class="status-text"></span>
+        </div>
+        <div id="coaching-report" class="coaching-report hidden"></div>
+      </div>
+
+      <div id="coaching-scouting" class="coaching-section hidden">
+        <div class="coaching-row">
+          <select id="scouting-team-select" class="select">
+            <option value="team1">Team 1</option>
+            <option value="team2">Team 2</option>
+          </select>
+          <button class="btn btn-primary" id="btn-get-scouting">Generate Scouting</button>
+          <span id="scouting-status" class="status-text"></span>
+        </div>
+        <div id="scouting-report" class="coaching-report hidden"></div>
+      </div>
+    </div>
+
+  </main>
+</div>
+
+<script src="/static/js/api.js"></script>
+<script src="/static/js/replay.js"></script>
+<script src="/static/js/app.js"></script>
+</body>
+</html>

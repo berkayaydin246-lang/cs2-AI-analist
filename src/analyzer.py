@@ -32,6 +32,10 @@ def analyze_player(parsed_data: dict, player_name: str) -> dict:
         kills, damages, grenades, shots, player_positions, rounds,
         player_name, total_rounds, map_name
     )
+
+    pro = _pro_metrics(kills, damages, grenades, player_name, total_rounds, stats, advanced)
+    advanced["pro_metrics"] = pro
+
     findings.extend(_advanced_findings(advanced, stats, player_name))
 
     return {
@@ -775,12 +779,204 @@ def _kast_calculation(kills, player_name, total_rounds) -> dict:
     }
 
 
+def _duel_analysis(kills, player_name) -> dict:
+    """1v1 duel kazanma oranını hesaplar (aynı round içinde karşılıklı öldürme çiftleri)."""
+    DUEL_WINDOW = 192  # ~3 saniye (64 tick)
+
+    by_round = defaultdict(list)
+    for k in kills:
+        rn = k.get("round_num")
+        if rn not in ("", None):
+            by_round[rn].append(k)
+
+    duels_won = 0
+    duels_lost = 0
+
+    for rn, round_kills in by_round.items():
+        sorted_kills = sorted(round_kills, key=lambda x: x.get("tick", 0))
+        used = set()
+
+        for i, k in enumerate(sorted_kills):
+            if i in used:
+                continue
+            if k.get("attacker_name") != player_name and k.get("victim_name") != player_name:
+                continue
+
+            try:
+                tick_i = int(k.get("tick", 0))
+            except (TypeError, ValueError):
+                continue
+
+            opponent = None
+            if k.get("attacker_name") == player_name:
+                opponent = k.get("victim_name")
+                player_won_first = True
+            elif k.get("victim_name") == player_name:
+                opponent = k.get("attacker_name")
+                player_won_first = False
+            if not opponent:
+                continue
+
+            # Karşılıklı duel mi kontrol et
+            is_duel = False
+            for j in range(i + 1, len(sorted_kills)):
+                if j in used:
+                    continue
+                k2 = sorted_kills[j]
+                try:
+                    tick_j = int(k2.get("tick", 0))
+                except (TypeError, ValueError):
+                    continue
+                if tick_j - tick_i > DUEL_WINDOW:
+                    break
+                # Karşı tarafın öldürdüğü veya öldüğü durum
+                if (k2.get("attacker_name") == opponent and k2.get("victim_name") == player_name) or \
+                   (k2.get("attacker_name") == player_name and k2.get("victim_name") == opponent):
+                    is_duel = True
+                    used.add(j)
+                    break
+
+            if not is_duel:
+                continue
+
+            used.add(i)
+            if player_won_first:
+                duels_won += 1
+            else:
+                duels_lost += 1
+
+    total_duels = duels_won + duels_lost
+    return {
+        "duels_won": duels_won,
+        "duels_lost": duels_lost,
+        "total_duels": total_duels,
+        "duel_win_rate": round(duels_won / max(total_duels, 1) * 100, 1),
+    }
+
+
+def _utility_effectiveness(grenades, damages, kills, player_name) -> dict:
+    """Utility etkinlik skoru: hasar/utility, flash assist oranı, smoke kullanım yoğunluğu."""
+    player_grenades = [g for g in grenades if g.get("thrower_name") == player_name]
+    total_util = len(player_grenades)
+
+    if total_util == 0:
+        return {"total_utility": 0, "utility_score": 0.0, "damage_per_util": 0.0,
+                "flash_efficiency": 0.0, "smoke_count": 0}
+
+    # Utility ile verilen hasar (molotov, incendiary, he_grenade)
+    util_damage = sum(
+        d.get("hp_damage", 0) for d in damages
+        if d.get("attacker_name") == player_name
+        and any(t in str(d.get("weapon", "")).lower() for t in ("molotov", "incendiary", "hegrenade", "he_grenade"))
+    )
+
+    # Flash asist
+    FLASH_WINDOW = 192
+    player_flashes = [g for g in player_grenades if g.get("grenade_type") == "flash"]
+    flash_count = len(player_flashes)
+    flash_assists = 0
+    team_kills = [k for k in kills if k.get("attacker_name") != player_name]
+    for flash in player_flashes:
+        try:
+            flash_tick = int(flash.get("tick", 0))
+        except (TypeError, ValueError):
+            continue
+        if not flash_tick:
+            continue
+        for k in team_kills:
+            try:
+                kill_tick = int(k.get("tick", 0))
+            except (TypeError, ValueError):
+                continue
+            if 0 < kill_tick - flash_tick < FLASH_WINDOW:
+                flash_assists += 1
+                break
+
+    smoke_count = sum(1 for g in player_grenades if g.get("grenade_type") == "smoke")
+
+    damage_per_util = round(util_damage / max(total_util, 1), 1)
+    flash_efficiency = round(flash_assists / max(flash_count, 1) * 100, 1)
+
+    # Bileşik skor: normalize edilmiş ağırlıklı ortalama (0-100 arası)
+    score = min(100.0, round(
+        (damage_per_util / 20.0) * 30 +  # hasar katkısı (max ~30)
+        (flash_efficiency / 100.0) * 40 +  # flash etkinliği (max 40)
+        min(smoke_count / 5.0, 1.0) * 30   # smoke kullanımı (max 30)
+    , 1))
+
+    return {
+        "total_utility": total_util,
+        "utility_damage": util_damage,
+        "damage_per_util": damage_per_util,
+        "flash_count": flash_count,
+        "flash_assists": flash_assists,
+        "flash_efficiency": flash_efficiency,
+        "smoke_count": smoke_count,
+        "utility_score": score,
+    }
+
+
+def _pro_metrics(kills, damages, grenades, player_name, total_rounds, stats, advanced) -> dict:
+    """HLTV Rating 2.0 (approx), Impact Rating, Entry Success, Duel Win Rate, Utility Score."""
+
+    kill_count = stats.get("kills", 0)
+    death_count = stats.get("deaths", 0)
+    adr = stats.get("adr", 0)
+
+    # KPR & SPR (Kills/Survivals per round)
+    kpr = kill_count / max(total_rounds, 1)
+    spr = (total_rounds - death_count) / max(total_rounds, 1)
+
+    # Impact: multi-kills + opening kills + clutch wins
+    mk = advanced.get("multi_kills", {})
+    clutches = advanced.get("clutches", [])
+    opening_kills = stats.get("opening_kills", 0)
+    clutch_wins = sum(1 for c in clutches if c.get("won"))
+    multi_count = mk.get("total_3k", 0) + mk.get("total_4k", 0) * 1.5 + mk.get("total_aces", 0) * 2
+    impact_raw = (opening_kills * 0.15 + multi_count * 0.3 + clutch_wins * 0.2) / max(total_rounds, 1)
+    impact_rating = round(min(impact_raw * 10, 3.0), 2)
+
+    # HLTV 2.0 approximate formula
+    # Based on: 0.0073*KAST + 0.3591*KPR - 0.5329*DPR + 0.2372*Impact + 0.0032*ADR + 0.1587
+    kast_pct = advanced.get("kast", {}).get("kast_percentage", 70)
+    dpr = death_count / max(total_rounds, 1)
+    hltv_rating = round(
+        0.0073 * kast_pct +
+        0.3591 * kpr -
+        0.5329 * dpr +
+        0.2372 * impact_rating +
+        0.0032 * adr +
+        0.1587
+    , 2)
+
+    # Entry success
+    opening_total = stats.get("opening_kills", 0) + stats.get("opening_deaths", 0)
+    entry_success = round(stats.get("opening_kills", 0) / max(opening_total, 1) * 100, 1)
+
+    # Duel analysis
+    duels = _duel_analysis(kills, player_name)
+
+    # Utility effectiveness
+    util_eff = _utility_effectiveness(grenades, damages, kills, player_name)
+
+    return {
+        "hltv_rating": hltv_rating,
+        "impact_rating": impact_rating,
+        "kpr": round(kpr, 2),
+        "spr": round(spr, 2),
+        "dpr": round(dpr, 2),
+        "entry_success_rate": entry_success,
+        "duels": duels,
+        "utility_effectiveness": util_eff,
+    }
+
+
 def _advanced_analysis(kills, damages, grenades, shots, player_positions, rounds,
                        player_name, total_rounds, map_name) -> dict:
     """Tüm gelişmiş analizleri çalıştırır."""
     side_map = _get_player_side_per_round(kills, player_positions, player_name)
 
-    return {
+    result = {
         "round_stats": _round_by_round_stats(kills, player_name),
         "side_stats": _side_specific_stats(kills, side_map, player_name),
         "clutches": _clutch_analysis(kills, player_name),
@@ -792,6 +988,8 @@ def _advanced_analysis(kills, damages, grenades, shots, player_positions, rounds
         "spray_transfers": _spray_transfer_detection(kills, player_name),
         "kast": _kast_calculation(kills, player_name, total_rounds),
     }
+
+    return result
 
 
 def _advanced_findings(advanced, stats, player_name) -> list:
