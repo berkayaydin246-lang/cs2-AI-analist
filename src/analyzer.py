@@ -33,7 +33,17 @@ def analyze_player(parsed_data: dict, player_name: str) -> dict:
         player_name, total_rounds, map_name
     )
 
-    pro = _pro_metrics(kills, damages, grenades, player_name, total_rounds, stats, advanced)
+    pro = _pro_metrics(
+        kills,
+        damages,
+        grenades,
+        shots,
+        player_positions,
+        player_name,
+        total_rounds,
+        stats,
+        advanced,
+    )
     advanced["pro_metrics"] = pro
 
     findings.extend(_advanced_findings(advanced, stats, player_name))
@@ -64,6 +74,14 @@ def _is_bullet_weapon(weapon: str) -> bool:
     return not any(tok in w for tok in banned)
 
 
+def _is_sniper_weapon(weapon: str) -> bool:
+    w = _normalize_weapon_name(weapon)
+    if not w:
+        return False
+    sniper_tokens = ("awp", "ssg08", "scout", "scar20", "g3sg1")
+    return any(tok in w for tok in sniper_tokens)
+
+
 def _calculate_stats(kills, damages, grenades, shots, player_positions, player_name, total_rounds) -> dict:
     """Temel istatistikleri hesaplar."""
 
@@ -73,7 +91,13 @@ def _calculate_stats(kills, damages, grenades, shots, player_positions, player_n
 
     kill_count = len(player_kills)
     death_count = len(player_deaths)
-    assist_count = 0  # assist verisi varsa eklenebilir
+    assist_count = sum(
+        1
+        for k in kills
+        if k.get("assister_name") == player_name
+        and k.get("attacker_name") != player_name
+        and k.get("victim_name") != player_name
+    )
 
     headshots = [k for k in player_kills if k.get("headshot") == True]
     hs_rate = round(len(headshots) / kill_count * 100, 1) if kill_count > 0 else 0.0
@@ -357,49 +381,133 @@ def _round_by_round_stats(kills, player_name) -> list:
     return [data[rn] for rn in sorted(data.keys())]
 
 
-def _side_specific_stats(kills, side_map, player_name) -> dict:
+def _side_specific_stats(kills, damages, side_map, player_name) -> dict:
     """T-side ve CT-side ayrı istatistikler."""
-    t_kills, t_deaths, t_hs = 0, 0, 0
-    ct_kills, ct_deaths, ct_hs = 0, 0, 0
-    t_rounds = sum(1 for s in side_map.values() if s == "T")
-    ct_rounds = sum(1 for s in side_map.values() if s == "CT")
+    def _rk(v):
+        try:
+            return int(float(v))
+        except (TypeError, ValueError):
+            return None
 
+    norm_side_map = {}
+    for rn, side in side_map.items():
+        rk = _rk(rn)
+        if rk is not None and side in ("T", "CT"):
+            norm_side_map[rk] = side
+
+    t_kills = t_deaths = t_hs = t_assists = t_damage = t_sniper_kills = 0
+    ct_kills = ct_deaths = ct_hs = ct_assists = ct_damage = ct_sniper_kills = 0
+    t_open_kills = t_open_deaths = 0
+    ct_open_kills = ct_open_deaths = 0
+
+    t_rounds = sum(1 for s in norm_side_map.values() if s == "T")
+    ct_rounds = sum(1 for s in norm_side_map.values() if s == "CT")
+
+    by_round = defaultdict(list)
     for k in kills:
-        rn = k.get("round_num")
-        if rn in ("", None) or rn not in side_map:
+        rk = _rk(k.get("round_num"))
+        if rk is None or rk not in norm_side_map:
             continue
-        is_t = side_map[rn] == "T"
+        by_round[rk].append(k)
+        is_t = norm_side_map[rk] == "T"
 
         if k.get("attacker_name") == player_name:
             if is_t:
                 t_kills += 1
                 if k.get("headshot"):
                     t_hs += 1
+                if _is_sniper_weapon(k.get("weapon")):
+                    t_sniper_kills += 1
             else:
                 ct_kills += 1
                 if k.get("headshot"):
                     ct_hs += 1
+                if _is_sniper_weapon(k.get("weapon")):
+                    ct_sniper_kills += 1
+
         if k.get("victim_name") == player_name:
             if is_t:
                 t_deaths += 1
             else:
                 ct_deaths += 1
 
+        if (
+            k.get("assister_name") == player_name
+            and k.get("attacker_name") != player_name
+            and k.get("victim_name") != player_name
+        ):
+            if is_t:
+                t_assists += 1
+            else:
+                ct_assists += 1
+
+    for rk, rkills in by_round.items():
+        if not rkills:
+            continue
+        first = min(rkills, key=lambda x: x.get("tick", float("inf")))
+        is_t = norm_side_map[rk] == "T"
+        if first.get("attacker_name") == player_name:
+            if is_t:
+                t_open_kills += 1
+            else:
+                ct_open_kills += 1
+        if first.get("victim_name") == player_name:
+            if is_t:
+                t_open_deaths += 1
+            else:
+                ct_open_deaths += 1
+
+    for d in damages:
+        rk = _rk(d.get("round_num"))
+        if rk is None or rk not in norm_side_map:
+            continue
+        if d.get("attacker_name") != player_name:
+            continue
+        try:
+            dmg = float(d.get("hp_damage", 0))
+        except (TypeError, ValueError):
+            dmg = 0.0
+        if norm_side_map[rk] == "T":
+            t_damage += dmg
+        else:
+            ct_damage += dmg
+
     return {
         "t_side": {
-            "kills": t_kills, "deaths": t_deaths,
+            "kills": t_kills,
+            "deaths": t_deaths,
+            "assists": t_assists,
+            "adr": round(t_damage / max(t_rounds, 1), 1),
             "kd_ratio": round(t_kills / max(t_deaths, 1), 2),
             "hs_rate": round(t_hs / max(t_kills, 1) * 100, 1),
+            "kpr": round(t_kills / max(t_rounds, 1), 2),
+            "dpr": round(t_deaths / max(t_rounds, 1), 2),
+            "apr": round(t_assists / max(t_rounds, 1), 2),
+            "opening_kills": t_open_kills,
+            "opening_deaths": t_open_deaths,
+            "opening_success": round(t_open_kills / max(t_open_kills + t_open_deaths, 1) * 100, 1),
+            "sniper_kills": t_sniper_kills,
+            "sniper_kills_per_round": round(t_sniper_kills / max(t_rounds, 1), 2),
             "rounds": t_rounds,
         },
         "ct_side": {
-            "kills": ct_kills, "deaths": ct_deaths,
+            "kills": ct_kills,
+            "deaths": ct_deaths,
+            "assists": ct_assists,
+            "adr": round(ct_damage / max(ct_rounds, 1), 1),
             "kd_ratio": round(ct_kills / max(ct_deaths, 1), 2),
             "hs_rate": round(ct_hs / max(ct_kills, 1) * 100, 1),
+            "kpr": round(ct_kills / max(ct_rounds, 1), 2),
+            "dpr": round(ct_deaths / max(ct_rounds, 1), 2),
+            "apr": round(ct_assists / max(ct_rounds, 1), 2),
+            "opening_kills": ct_open_kills,
+            "opening_deaths": ct_open_deaths,
+            "opening_success": round(ct_open_kills / max(ct_open_kills + ct_open_deaths, 1) * 100, 1),
+            "sniper_kills": ct_sniper_kills,
+            "sniper_kills_per_round": round(ct_sniper_kills / max(ct_rounds, 1), 2),
             "rounds": ct_rounds,
         },
     }
-
 
 def _clutch_analysis(kills, player_name) -> list:
     """1vX clutch durumlarını tespit eder."""
@@ -850,7 +958,7 @@ def _duel_analysis(kills, player_name) -> dict:
         "duels_won": duels_won,
         "duels_lost": duels_lost,
         "total_duels": total_duels,
-        "duel_win_rate": round(duels_won / max(total_duels, 1) * 100, 1),
+        "duel_win_rate": round(duels_won / total_duels * 100, 1) if total_duels > 0 else None,
     }
 
 
@@ -916,58 +1024,275 @@ def _utility_effectiveness(grenades, damages, kills, player_name) -> dict:
     }
 
 
-def _pro_metrics(kills, damages, grenades, player_name, total_rounds, stats, advanced) -> dict:
-    """HLTV Rating 2.0 (approx), Impact Rating, Entry Success, Duel Win Rate, Utility Score."""
+def _round_key(v):
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return None
 
-    kill_count = stats.get("kills", 0)
-    death_count = stats.get("deaths", 0)
-    adr = stats.get("adr", 0)
 
-    # KPR & SPR (Kills/Survivals per round)
-    kpr = kill_count / max(total_rounds, 1)
-    spr = (total_rounds - death_count) / max(total_rounds, 1)
+def _filter_by_rounds(events, round_set):
+    if not round_set:
+        return []
+    out = []
+    for ev in events:
+        rk = _round_key(ev.get("round_num"))
+        if rk is not None and rk in round_set:
+            out.append(ev)
+    return out
 
-    # Impact: multi-kills + opening kills + clutch wins
-    mk = advanced.get("multi_kills", {})
-    clutches = advanced.get("clutches", [])
-    opening_kills = stats.get("opening_kills", 0)
+
+def _scope_stats(kills, damages, shots, player_name, total_rounds) -> dict:
+    player_kills = [k for k in kills if k.get("attacker_name") == player_name]
+    player_deaths = [k for k in kills if k.get("victim_name") == player_name]
+    assist_count = sum(
+        1
+        for k in kills
+        if k.get("assister_name") == player_name
+        and k.get("attacker_name") != player_name
+        and k.get("victim_name") != player_name
+    )
+
+    kill_count = len(player_kills)
+    death_count = len(player_deaths)
+    hs_count = sum(1 for k in player_kills if k.get("headshot"))
+
+    total_damage = 0.0
+    for d in damages:
+        if d.get("attacker_name") != player_name:
+            continue
+        try:
+            total_damage += float(d.get("hp_damage", 0))
+        except (TypeError, ValueError):
+            continue
+
+    player_shots = [s for s in shots if s.get("shooter_name") == player_name and _is_bullet_weapon(s.get("weapon"))]
+    player_bullet_hits = [d for d in damages if d.get("attacker_name") == player_name and _is_bullet_weapon(d.get("weapon"))]
+    hit_ticks = {d.get("tick") for d in player_bullet_hits if d.get("tick") not in ("", None)}
+    shot_count = len(player_shots)
+    hit_shots = len(hit_ticks)
+    accuracy = round((hit_shots / shot_count) * 100, 1) if shot_count > 0 else 0.0
+
+    return {
+        "rounds": int(total_rounds),
+        "kills": kill_count,
+        "deaths": death_count,
+        "assists": assist_count,
+        "hs_rate": round(hs_count / max(kill_count, 1) * 100, 1),
+        "kd_ratio": round(kill_count / max(death_count, 1), 2),
+        "total_damage": round(total_damage, 1),
+        "adr": round(total_damage / max(total_rounds, 1), 1),
+        "kpr": round(kill_count / max(total_rounds, 1), 2),
+        "dpr": round(death_count / max(total_rounds, 1), 2),
+        "apr": round(assist_count / max(total_rounds, 1), 2),
+        "accuracy": accuracy,
+    }
+
+
+def _impact_rating(multi_kills, clutches, opening_kills, total_rounds) -> float:
     clutch_wins = sum(1 for c in clutches if c.get("won"))
-    multi_count = mk.get("total_3k", 0) + mk.get("total_4k", 0) * 1.5 + mk.get("total_aces", 0) * 2
+    multi_count = (
+        multi_kills.get("total_3k", 0)
+        + multi_kills.get("total_4k", 0) * 1.5
+        + multi_kills.get("total_aces", 0) * 2
+    )
     impact_raw = (opening_kills * 0.15 + multi_count * 0.3 + clutch_wins * 0.2) / max(total_rounds, 1)
-    impact_rating = round(min(impact_raw * 10, 3.0), 2)
+    return round(min(impact_raw * 10, 3.0), 2)
 
-    # HLTV 2.0 approximate formula
-    # Based on: 0.0073*KAST + 0.3591*KPR - 0.5329*DPR + 0.2372*Impact + 0.0032*ADR + 0.1587
-    kast_pct = advanced.get("kast", {}).get("kast_percentage", 70)
-    dpr = death_count / max(total_rounds, 1)
-    hltv_rating = round(
+
+def _hltv_approx_rating(kast_pct, kpr, dpr, impact_rating, adr) -> float:
+    return round(
         0.0073 * kast_pct +
         0.3591 * kpr -
         0.5329 * dpr +
         0.2372 * impact_rating +
         0.0032 * adr +
-        0.1587
-    , 2)
+        0.1587,
+        2,
+    )
 
-    # Entry success
-    opening_total = stats.get("opening_kills", 0) + stats.get("opening_deaths", 0)
-    entry_success = round(stats.get("opening_kills", 0) / max(opening_total, 1) * 100, 1)
 
-    # Duel analysis
-    duels = _duel_analysis(kills, player_name)
+def _opening_metrics(kills, player_name, total_rounds) -> dict:
+    by_round = defaultdict(list)
+    for k in kills:
+        rn = k.get("round_num")
+        if rn not in ("", None):
+            by_round[rn].append(k)
 
-    # Utility effectiveness
-    util_eff = _utility_effectiveness(grenades, damages, kills, player_name)
+    opening_kills = 0
+    opening_deaths = 0
+    opening_attempts = opening_kills + opening_deaths
+    rounds_with_kill = 0
+    rounds_with_multi = 0
+
+    for _, rkills in by_round.items():
+        if not rkills:
+            continue
+        first = min(rkills, key=lambda x: x.get("tick", float("inf")))
+        if first.get("attacker_name") == player_name:
+            opening_kills += 1
+        if first.get("victim_name") == player_name:
+            opening_deaths += 1
+
+        p_kills = sum(1 for ev in rkills if ev.get("attacker_name") == player_name)
+        if p_kills >= 1:
+            rounds_with_kill += 1
+        if p_kills >= 2:
+            rounds_with_multi += 1
+
+    opening_attempts = opening_kills + opening_deaths
+    opening_success = round(opening_kills / max(opening_attempts, 1) * 100, 1)
+    opening_kpr = round(opening_kills / max(total_rounds, 1), 2)
+    opening_dpr = round(opening_deaths / max(total_rounds, 1), 2)
 
     return {
-        "hltv_rating": hltv_rating,
-        "impact_rating": impact_rating,
-        "kpr": round(kpr, 2),
-        "spr": round(spr, 2),
-        "dpr": round(dpr, 2),
-        "entry_success_rate": entry_success,
-        "duels": duels,
-        "utility_effectiveness": util_eff,
+        "opening_kills": opening_kills,
+        "opening_deaths": opening_deaths,
+        "opening_attempts": opening_attempts,
+        "opening_success": opening_success,
+        "opening_kills_per_round": opening_kpr,
+        "opening_deaths_per_round": opening_dpr,
+        "opening_attempts_per_round": round(opening_attempts / max(total_rounds, 1), 2),
+        "rounds_with_kill_pct": round(rounds_with_kill / max(total_rounds, 1) * 100, 1),
+        "rounds_with_multi_kill_pct": round(rounds_with_multi / max(total_rounds, 1) * 100, 1),
+    }
+
+
+def _sniping_metrics(kills, player_name, total_rounds) -> dict:
+    by_round = defaultdict(list)
+    player_kills = []
+    sniper_kills = []
+    sniper_opening_kills = 0
+
+    for k in kills:
+        rn = k.get("round_num")
+        if rn not in ("", None):
+            by_round[rn].append(k)
+        if k.get("attacker_name") == player_name:
+            player_kills.append(k)
+            if _is_sniper_weapon(k.get("weapon")):
+                sniper_kills.append(k)
+
+    sniper_round_kills = defaultdict(int)
+    for k in sniper_kills:
+        rn = k.get("round_num")
+        if rn in ("", None):
+            continue
+        sniper_round_kills[rn] += 1
+
+    for _, rkills in by_round.items():
+        first = min(rkills, key=lambda x: x.get("tick", float("inf")))
+        if first.get("attacker_name") == player_name and _is_sniper_weapon(first.get("weapon")):
+            sniper_opening_kills += 1
+
+    total_kills = len(player_kills)
+    sniper_count = len(sniper_kills)
+    rounds_with_sniper_kill = len(sniper_round_kills)
+    sniper_multi_rounds = sum(1 for v in sniper_round_kills.values() if v >= 2)
+
+    return {
+        "sniper_kills": sniper_count,
+        "sniper_kills_per_round": round(sniper_count / max(total_rounds, 1), 2),
+        "sniper_kill_percentage": round(sniper_count / max(total_kills, 1) * 100, 1),
+        "rounds_with_sniper_kill_percentage": round(rounds_with_sniper_kill / max(total_rounds, 1) * 100, 1),
+        "sniper_multi_kill_rounds": sniper_multi_rounds,
+        "sniper_multi_kill_rounds_per_round": round(sniper_multi_rounds / max(total_rounds, 1), 2),
+        "sniper_opening_kills": sniper_opening_kills,
+        "sniper_opening_kills_per_round": round(sniper_opening_kills / max(total_rounds, 1), 2),
+    }
+
+
+def _pro_metrics(kills, damages, grenades, shots, player_positions, player_name, total_rounds, stats, advanced) -> dict:
+    """HLTV Rating 2.0 (approx), Impact Rating, Entry Success, Duel Win Rate, Utility Score."""
+
+    def _scope_metrics(scope_kills, scope_damages, scope_grenades, scope_shots, scope_rounds, kast_override=None):
+        scope_stats = _scope_stats(scope_kills, scope_damages, scope_shots, player_name, scope_rounds)
+        opening = _opening_metrics(scope_kills, player_name, scope_rounds)
+        sniping = _sniping_metrics(scope_kills, player_name, scope_rounds)
+        duels = _duel_analysis(scope_kills, player_name)
+        util_eff = _utility_effectiveness(scope_grenades, scope_damages, scope_kills, player_name)
+        trading = _trade_kill_analysis(scope_kills, player_name)
+        multi_kills = _multi_kill_rounds(scope_kills, player_name)
+        clutches = _clutch_analysis(scope_kills, player_name)
+        clutch_won = sum(1 for c in clutches if c.get("won"))
+
+        spr = (scope_rounds - scope_stats["deaths"]) / max(scope_rounds, 1)
+        dpr = scope_stats["deaths"] / max(scope_rounds, 1)
+        if kast_override is not None:
+            kast_pct = float(kast_override)
+        else:
+            kast_pct = _kast_calculation(scope_kills, player_name, scope_rounds).get("kast_percentage", 0.0)
+        impact_rating = _impact_rating(multi_kills, clutches, opening["opening_kills"], scope_rounds)
+        hltv_rating = _hltv_approx_rating(kast_pct, scope_stats["kpr"], dpr, impact_rating, scope_stats["adr"])
+
+        return {
+            **scope_stats,
+            "spr": round(spr, 2),
+            "hltv_rating": hltv_rating,
+            "impact_rating": impact_rating,
+            "kast_percentage": round(kast_pct, 1),
+            "entry_success_rate": opening["opening_success"],
+            "duels": duels,
+            "utility_effectiveness": util_eff,
+            "trading": trading,
+            "opening": opening,
+            "sniping": sniping,
+            "multi_kills": multi_kills,
+            "clutches": {
+                "attempts": len(clutches),
+                "won": clutch_won,
+                "win_rate": round(clutch_won / max(len(clutches), 1) * 100, 1) if clutches else 0.0,
+            },
+        }
+
+    global_scope = _scope_metrics(
+        kills,
+        damages,
+        grenades,
+        shots,
+        total_rounds,
+        advanced.get("kast", {}).get("kast_percentage", 70.0),
+    )
+
+    side_map = _get_player_side_per_round(kills, player_positions, player_name)
+    norm_side_map = {}
+    for rn, side in side_map.items():
+        rk = _round_key(rn)
+        if rk is not None and side in ("T", "CT"):
+            norm_side_map[rk] = side
+
+    t_rounds = {rk for rk, side in norm_side_map.items() if side == "T"}
+    ct_rounds = {rk for rk, side in norm_side_map.items() if side == "CT"}
+
+    t_kills = _filter_by_rounds(kills, t_rounds)
+    t_damages = _filter_by_rounds(damages, t_rounds)
+    t_grenades = _filter_by_rounds(grenades, t_rounds)
+    t_shots = _filter_by_rounds(shots, t_rounds)
+
+    ct_kills = _filter_by_rounds(kills, ct_rounds)
+    ct_damages = _filter_by_rounds(damages, ct_rounds)
+    ct_grenades = _filter_by_rounds(grenades, ct_rounds)
+    ct_shots = _filter_by_rounds(shots, ct_rounds)
+
+    t_scope = _scope_metrics(t_kills, t_damages, t_grenades, t_shots, max(len(t_rounds), 0))
+    ct_scope = _scope_metrics(ct_kills, ct_damages, ct_grenades, ct_shots, max(len(ct_rounds), 0))
+
+    return {
+        "hltv_rating": global_scope["hltv_rating"],
+        "impact_rating": global_scope["impact_rating"],
+        "kpr": global_scope["kpr"],
+        "spr": global_scope["spr"],
+        "dpr": global_scope["dpr"],
+        "entry_success_rate": global_scope["entry_success_rate"],
+        "duels": global_scope["duels"],
+        "utility_effectiveness": global_scope["utility_effectiveness"],
+        "opening": global_scope["opening"],
+        "sniping": global_scope["sniping"],
+        "sides": {
+            "both": global_scope,
+            "t": t_scope,
+            "ct": ct_scope,
+        },
     }
 
 
@@ -978,7 +1303,7 @@ def _advanced_analysis(kills, damages, grenades, shots, player_positions, rounds
 
     result = {
         "round_stats": _round_by_round_stats(kills, player_name),
-        "side_stats": _side_specific_stats(kills, side_map, player_name),
+        "side_stats": _side_specific_stats(kills, damages, side_map, player_name),
         "clutches": _clutch_analysis(kills, player_name),
         "trade_stats": _trade_kill_analysis(kills, player_name),
         "multi_kills": _multi_kill_rounds(kills, player_name),
@@ -1114,3 +1439,4 @@ def _advanced_findings(advanced, stats, player_name) -> list:
         })
 
     return findings
+

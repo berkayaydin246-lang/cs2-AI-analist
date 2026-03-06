@@ -20,7 +20,7 @@ CS2 AI Coach, **tek bir .dem dosyasi** uzerinden profesyonel seviyede web arayuz
 - Rakip scouting raporu (AI)
 - Interaktif 2D round replay (Canvas)
 
-## Current Features (v1.0)
+## Current Features (v1.1)
 
 ### Demo Parsing
 - Parse `.dem` with `awpy 2.x` (Polars DataFrames, named-column aliasing)
@@ -135,6 +135,19 @@ Then open [http://localhost:8000](http://localhost:8000).
 | POST | `/api/demo/{id}/scouting/{team}` | AI scouting report |
 
 ## Changelog
+
+### v1.1
+- **Improve**: Player summary metric cards are now grouped by performance level:
+  - Strong Performance (green)
+  - Average Performance (yellow)
+  - Weak Performance (red)
+- **Improve**: Metric status labels now use benchmark-aware evaluation (value vs Avg marker), not raw text parsing.
+- **Improve**: Direction-aware status logic:
+  - Higher is better for ADR, K/D, KPR, HS%, Accuracy, A/R, Opening success, Total Damage
+  - Lower is better for DPR
+- **Fix**: Incorrect status labels on cards such as `A / Round` and `Opening W/L` when values were above Avg.
+- **Improve**: Detailed statistics area rendered as cleaner grouped block cards for better readability.
+- **Improve**: Side-based player metric consistency strengthened via scoped `pro_metrics.sides` data flow in analyzer/frontend integration.
 
 ### v1.0
 - **New**: FastAPI backend + vanilla JS SPA replaces Streamlit
