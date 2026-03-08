@@ -178,11 +178,9 @@ def _infer_round_by_tick(tick: int, round_bounds_sorted: list[tuple[int, int, in
     for rn, start, end in round_bounds_sorted:
         if start <= tick <= end:
             return rn
-    if not round_bounds_sorted:
-        return 0
-
-    nearest = min(round_bounds_sorted, key=lambda t: abs(t[1] - tick))
-    return nearest[0]
+    # Do not force-map out-of-bound events to nearest round;
+    # this can shift events early/late around round boundaries.
+    return 0
 
 
 def _extract_grenade_events(

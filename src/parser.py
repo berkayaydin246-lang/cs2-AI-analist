@@ -59,8 +59,11 @@ def parse_demo(demo_path: str) -> dict:
     print(f"[+] Round sayÄ±sÄ±: {total_rounds}")
     print(f"[+] Kill sayÄ±sÄ± : {len(kills_df)}")
 
+    player_positions = _process_ticks(ticks_df)
+    player_identities = _build_player_identities(player_positions)
+
     result = {
-        "schema_version": 8,
+        "schema_version": 9,
         "map":          map_name,
         "total_rounds": total_rounds,
         "map_bounds":   _extract_map_bounds(ticks_df),
@@ -69,7 +72,8 @@ def parse_demo(demo_path: str) -> dict:
         "grenades":     _process_grenades(grenades_df),
         "bomb_events":  _process_bomb_events(bomb_df),
         "shots":        _process_shots(shots_df),
-        "player_positions": _process_ticks(ticks_df),
+        "player_positions": player_positions,
+        "player_identities": player_identities,
         "rounds":       _process_rounds(rounds_df),
         "players":      _get_player_list(kills_df),
     }
@@ -104,17 +108,42 @@ def _process_kills(df: pd.DataFrame) -> list:
         })
 
     else:
-        # awpy Polars uses uppercase X/Y coords â€” normalize to lowercase
-        coord_rename = {}
+        rename_map = {}
         for col in df.columns:
-            if col == "victim_X":   coord_rename[col] = "victim_x"
-            elif col == "victim_Y": coord_rename[col] = "victim_y"
-        if coord_rename:
-            df = df.rename(columns=coord_rename)
+            cl = str(col).lower()
+            if cl in ("attacker_name", "attacker", "killer_name", "killer"):
+                rename_map[col] = "attacker_name"
+            elif cl in ("victim_name", "victim", "dead_player_name", "killed_name"):
+                rename_map[col] = "victim_name"
+            elif cl in ("assister_name", "assister", "assistant_name", "assist_player_name"):
+                rename_map[col] = "assister_name"
+            elif cl in ("weapon", "weapon_name"):
+                rename_map[col] = "weapon"
+            elif cl in ("headshot", "is_headshot", "head_shot"):
+                rename_map[col] = "headshot"
+            elif cl in ("attacker_side", "attacker_team", "killer_side", "killer_team"):
+                rename_map[col] = "attacker_side"
+            elif cl in ("victim_side", "victim_team"):
+                rename_map[col] = "victim_side"
+            elif cl in ("tick", "game_tick"):
+                rename_map[col] = "tick"
+            elif cl in ("round", "round_num"):
+                rename_map[col] = "round_num"
+            elif cl in ("victim_x", "victim_xpos", "victim_x_position"):
+                rename_map[col] = "victim_x"
+            elif cl in ("victim_y", "victim_ypos", "victim_y_position"):
+                rename_map[col] = "victim_y"
+            # awpy Polars can use uppercase coordinate fields
+            elif col == "victim_X":
+                rename_map[col] = "victim_x"
+            elif col == "victim_Y":
+                rename_map[col] = "victim_y"
+        if rename_map:
+            df = df.rename(columns=rename_map)
 
-    keep = [c for c in ["attacker_name", "victim_name", "weapon",
-                         "headshot", "attacker_side", "victim_side",
-                         "tick", "victim_x", "victim_y", "round_num"] if c in df.columns]
+    keep = [c for c in ["attacker_name", "victim_name", "assister_name", "weapon",
+                        "headshot", "attacker_side", "victim_side",
+                        "tick", "victim_x", "victim_y", "round_num"] if c in df.columns]
     return df[keep].fillna("").to_dict(orient="records")
 
 
@@ -214,6 +243,16 @@ def _process_ticks(df: pd.DataFrame, sample_step: int = 8) -> list:
     if df is None or len(df) == 0:
         return []
 
+    def _is_probable_steamid64_series(series: pd.Series) -> bool:
+        vals = pd.to_numeric(series, errors="coerce").dropna()
+        if len(vals) < 50:
+            return False
+        vals = vals.astype("int64")
+        # SteamID64 values for players are typically in this broad range.
+        in_range = (vals >= 76561100000000000) & (vals <= 76561399999999999)
+        ratio = float(in_range.mean()) if len(vals) else 0.0
+        return ratio >= 0.75 and int(vals.nunique()) >= 5
+
     if not isinstance(df.columns[0], str):
         rename_map = {
             2: "side",
@@ -222,11 +261,13 @@ def _process_ticks(df: pd.DataFrame, sample_step: int = 8) -> list:
             8: "player_name",
             9: "round_num",
         }
+        if 0 in df.columns and _is_probable_steamid64_series(df[0]):
+            rename_map[0] = "steamid"
         # Bazi schema'larda tick kolonu farkli bir integer index'te gelebilir.
         # Ilk bulunan kolonu almak steamid gibi alanlari yanlis secmeye neden olur.
         tick_col = None
         tick_score = None
-        reserved = {2, 3, 4, 8, 9}
+        reserved = {2, 3, 4, 8, 9, 0}
         for col in df.columns:
             if col in reserved:
                 continue
@@ -269,6 +310,8 @@ def _process_ticks(df: pd.DataFrame, sample_step: int = 8) -> list:
                 rename_map[col] = "hp"
             elif cl in ("armor", "armour", "player_armor", "player_armour"):
                 rename_map[col] = "armor"
+            elif cl in ("steamid", "steam_id", "steamid64", "steam64", "steam_id64", "player_steamid"):
+                rename_map[col] = "steamid"
         if rename_map:
             df = df.rename(columns=rename_map)
 
@@ -300,6 +343,8 @@ def _process_ticks(df: pd.DataFrame, sample_step: int = 8) -> list:
         sampled["hp"] = pd.to_numeric(sampled["hp"], errors="coerce")
     if "armor" in sampled.columns:
         sampled["armor"] = pd.to_numeric(sampled["armor"], errors="coerce")
+    if "steamid" in sampled.columns:
+        sampled["steamid"] = pd.to_numeric(sampled["steamid"], errors="coerce").astype("Int64")
 
     # Tick yoksa veya tamamen bossa oyuncu bazli fallback timeline uret.
     if "tick" not in sampled.columns:
@@ -313,7 +358,7 @@ def _process_ticks(df: pd.DataFrame, sample_step: int = 8) -> list:
                 lambda s: s.interpolate(limit_direction="both")
             )
 
-    keep = [c for c in ["player_name", "x", "y", "side", "round_num", "tick", "yaw", "hp", "armor"] if c in sampled.columns]
+    keep = [c for c in ["player_name", "steamid", "x", "y", "side", "round_num", "tick", "yaw", "hp", "armor"] if c in sampled.columns]
     rows = sampled[keep].to_dict(orient="records")
     print(f"[+] Player positions (sampled): {len(rows)}")
     return rows
@@ -331,7 +376,7 @@ def _process_bomb_events(df: pd.DataFrame) -> list:
     rename_map = {}
     for col in df.columns:
         cl = str(col).lower()
-        if cl in ("tick",):
+        if cl in ("tick", "game_tick", "tick_id", "gametick"):
             rename_map[col] = "tick"
         elif cl in ("round", "round_num"):
             rename_map[col] = "round_num"
@@ -380,7 +425,12 @@ def _process_bomb_events(df: pd.DataFrame) -> list:
     keep = [c for c in ["event", "tick", "round_num", "player_name", "x", "y"] if c in df.columns]
     if not keep:
         return []
-    return df[keep].fillna("").to_dict(orient="records")
+    out = df[keep].copy()
+    if "tick" in out.columns:
+        out = out.dropna(subset=["tick"])
+        out = out[out["tick"] > 0]
+        out["tick"] = out["tick"].astype(int)
+    return out.fillna("").to_dict(orient="records")
 
 
 def _extract_map_bounds(df: pd.DataFrame) -> dict:
@@ -480,8 +530,15 @@ def _process_grenades(df: pd.DataFrame) -> list:
     # Normalize grenade type names (CSmokeGrenade â†’ smoke, CFlashbang â†’ flash)
     df["grenade_type"] = df["grenade_type"].astype(str).apply(_normalize_grenade_type)
 
-    # Projectile satÄ±rlarÄ±nÄ± filtrele â€” sadece "Grenade" (throw) eventlerini kullan,
-    # ama koordinatlar genellikle Projectile'da olduÄŸu iÃ§in hepsini tut
+    # Tick/round normalize et.
+    if "tick" in df.columns:
+        df["tick"] = pd.to_numeric(df["tick"], errors="coerce")
+        df = df.dropna(subset=["tick"])
+        df["tick"] = df["tick"].astype(int)
+        df = df[df["tick"] > 0]
+    if "round_num" in df.columns:
+        df["round_num"] = pd.to_numeric(df["round_num"], errors="coerce")
+
     # Deduplikasyon: AynÄ± oyuncu + aynÄ± tip iÃ§in ardÄ±ÅŸÄ±k tick'leri (gap < 64) tek atÄ±ÅŸ say
     df = df.sort_values("tick") if "tick" in df.columns else df
 
@@ -508,6 +565,10 @@ def _process_grenades(df: pd.DataFrame) -> list:
                                    (group["tick"] <= ticks[i - 1])]
                 entry = {"thrower_name": player, "grenade_type": gtype, "tick": int(ticks[throw_start_idx])}
                 _add_grenade_coords(entry, throw_rows)
+                if "round_num" in throw_rows.columns:
+                    rn_vals = pd.to_numeric(throw_rows["round_num"], errors="coerce").dropna()
+                    if not rn_vals.empty:
+                        entry["round_num"] = int(rn_vals.iloc[0])
                 throws.append(entry)
                 throw_start_idx = i
 
@@ -515,6 +576,10 @@ def _process_grenades(df: pd.DataFrame) -> list:
         throw_rows = group[group["tick"] >= ticks[throw_start_idx]]
         entry = {"thrower_name": player, "grenade_type": gtype, "tick": int(ticks[throw_start_idx])}
         _add_grenade_coords(entry, throw_rows)
+        if "round_num" in throw_rows.columns:
+            rn_vals = pd.to_numeric(throw_rows["round_num"], errors="coerce").dropna()
+            if not rn_vals.empty:
+                entry["round_num"] = int(rn_vals.iloc[0])
         throws.append(entry)
 
     print(f"[+] Grenade throws (deduplicated): {len(throws)}")
@@ -609,6 +674,43 @@ def _get_player_list(df: pd.DataFrame) -> list:
 
     players = {p for p in players if isinstance(p, str) and 2 < len(p) < 40 and not p.isdigit()}
     return sorted(players)
+
+
+def _normalize_steamid64(value) -> str | None:
+    try:
+        sval = str(int(float(value))).strip()
+    except (TypeError, ValueError):
+        return None
+    if len(sval) < 16 or len(sval) > 20:
+        return None
+    if not sval.isdigit():
+        return None
+    return sval
+
+
+def _build_player_identities(player_positions: list) -> dict:
+    identities = {}
+    if not player_positions:
+        return identities
+
+    counts = {}
+    for row in player_positions:
+        name = str(row.get("player_name") or "").strip()
+        sid = _normalize_steamid64(row.get("steamid"))
+        if not name or not sid:
+            continue
+        key = (name, sid)
+        counts[key] = counts.get(key, 0) + 1
+
+    best_by_name = {}
+    for (name, sid), cnt in counts.items():
+        prev = best_by_name.get(name)
+        if prev is None or cnt > prev[1]:
+            best_by_name[name] = (sid, cnt)
+
+    for name, (sid, _) in best_by_name.items():
+        identities[name] = {"steamid64": sid}
+    return identities
 
 
 def save_parsed_data(data: dict, output_path: str):

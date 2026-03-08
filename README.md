@@ -107,9 +107,14 @@ Download map radar images:
 awpy get maps
 ```
 
-Create `.env`:
+Create `.env` (copy from `.env.example`):
 ```env
+# Required — AI coaching and scouting reports
 ANTHROPIC_API_KEY=sk-ant-...
+
+# Optional — Steam avatar images and profile links in Player view
+# Get your key at: https://steamcommunity.com/dev/apikey
+STEAM_API_KEY=
 ```
 
 Run the web server:
@@ -133,8 +138,20 @@ Then open [http://localhost:8000](http://localhost:8000).
 | GET  | `/api/demo/{id}/replay/{round}` | Replay frames + kills + bombs + grenades |
 | POST | `/api/demo/{id}/coaching/{player}` | AI coaching report |
 | POST | `/api/demo/{id}/scouting/{team}` | AI scouting report |
+| GET  | `/api/demo/{id}/player/{player}/steam` | Steam avatar + profile URL (requires `STEAM_API_KEY`) |
+| GET  | `/api/demo/{id}/player/{player}/visuals` | Generated heatmaps, utility map, route GIF |
 
 ## Changelog
+
+### v1.2
+- **New**: Steam profile integration — player avatar image and "Player Profile" link in the player header
+  - Backend: `GET /api/demo/{id}/player/{player}/steam` resolves SteamID64 from parsed demo data, calls `ISteamUser/GetPlayerSummaries`, returns `avatar_url` + `profile_url`
+  - Parser: `_build_player_identities()` extracts SteamID64 from tick data and stores as `player_identities` in parsed output
+  - Frontend: real avatar replaces letter placeholder when available; disabled button shown on fallback
+  - Caching per session; failure results cached for 30 s to avoid redundant calls
+  - Debug mode: add `?steamDebug=1` to URL to log Steam API responses to browser console
+  - Requires `STEAM_API_KEY` in `.env` (see Setup)
+- **New**: `.env.example` for quick project setup
 
 ### v1.1
 - **Improve**: Player summary metric cards are now grouped by performance level:

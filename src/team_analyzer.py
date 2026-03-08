@@ -689,7 +689,7 @@ def _compute_team_scores(
     parsed_data: dict[str, Any],
     team_side_by_round: dict[str, dict[int, str]],
 ) -> dict[str, int]:
-    """Count rounds won by each team using rounds winner_side + team side map."""
+    """Count rounds won by each team using round winner side + team side map."""
     rounds = parsed_data.get("rounds", [])
     team1_score = 0
     team2_score = 0
@@ -698,7 +698,12 @@ def _compute_team_scores(
 
     for r in rounds:
         rn = _safe_int(r.get("round_num", r.get("round", 0)), 0)
-        raw_winner = str(r.get("winner_side") or r.get("winnerSide") or "").strip()
+        raw_winner = str(
+            r.get("winner_side")
+            or r.get("winnerSide")
+            or r.get("winner")
+            or ""
+        ).strip()
         if not rn or not raw_winner:
             continue
         winner_side = _normalize_side(raw_winner)

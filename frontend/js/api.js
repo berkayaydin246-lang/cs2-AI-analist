@@ -58,6 +58,18 @@ const API = (() => {
       return POST(`/api/demo/${demoId}/analyze/${encodeURIComponent(playerName)}`);
     },
 
+    /** Fetch Steam profile metadata for selected player (avatar/profile url) */
+    getPlayerSteamProfile(demoId, playerName, opts = {}) {
+      const refresh = opts.refresh ? 1 : 0;
+      const debug = opts.debug ? 1 : 0;
+      return GET(`/api/demo/${demoId}/player/${encodeURIComponent(playerName)}/steam?refresh=${refresh}&debug=${debug}`);
+    },
+
+    /** Get generated player visuals (heatmaps, utility map, route gif) */
+    getPlayerVisuals(demoId, playerName) {
+      return GET(`/api/demo/${demoId}/player/${encodeURIComponent(playerName)}/visuals`);
+    },
+
     /** Get team analysis (all 10 players, setups, executes, round tags) */
     getTeamAnalysis(demoId) {
       return GET(`/api/demo/${demoId}/team`);

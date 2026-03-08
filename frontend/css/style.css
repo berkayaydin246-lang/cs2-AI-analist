@@ -289,10 +289,55 @@ img { display: block; max-width: 100%; }
 
 .player-hero-head {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
   gap: 16px;
   margin-bottom: 14px;
+}
+
+.player-hero-identity {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.player-hero-avatar-wrap {
+  width: 72px;
+  height: 72px;
+  border-radius: 999px;
+  border: 1px solid var(--border-light);
+  background: rgba(5, 10, 19, 0.75);
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.28);
+  overflow: hidden;
+  flex: 0 0 auto;
+}
+
+.player-hero-avatar {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: 999px;
+  display: block;
+}
+
+.player-hero-avatar-fallback {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-primary);
+  font-weight: 700;
+  font-size: 24px;
+  text-transform: uppercase;
+  background: linear-gradient(145deg, rgba(34, 211, 238, 0.26), rgba(30, 64, 175, 0.22));
+}
+
+.player-hero-meta {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
 }
 
 .player-hero-title {
@@ -302,10 +347,35 @@ img { display: block; max-width: 100%; }
   color: var(--text-primary);
 }
 
+.player-hero-persona {
+  margin-top: 3px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
 .player-hero-sub {
   margin-top: 4px;
   font-size: 12px;
   color: var(--text-secondary);
+}
+
+.player-hero-profile-wrap {
+  margin-top: 10px;
+}
+
+.player-profile-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 30px;
+  padding: 6px 12px;
+  font-size: 12px;
+  border-radius: 8px;
+}
+
+.player-profile-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
 }
 
 .player-hero-rating {
@@ -1360,6 +1430,7 @@ img { display: block; max-width: 100%; }
   .panel-block { flex: 1; }
   .player-hero-head { flex-direction: column; align-items: stretch; }
   .player-hero-rating { text-align: left; width: fit-content; }
+  .player-hero-avatar-wrap { width: 58px; height: 58px; }
 }
 @media (max-width: 720px) {
   :root { --sidebar-w: 64px; }
@@ -1372,4 +1443,6 @@ img { display: block; max-width: 100%; }
   .metric-toolbar { flex-wrap: wrap; }
   .metric-toolbar-group { width: 100%; justify-content: flex-start; overflow-x: auto; }
   .metric-toolbar-meta { width: 100%; justify-content: flex-end; }
+  .player-hero-identity { align-items: flex-start; }
+  .player-hero-avatar-wrap { width: 52px; height: 52px; }
 }

@@ -14,6 +14,7 @@ const State = {
   teamAnalysis: null,
   analyses:     {},
   playerVisuals: {},
+  playerSteamProfiles: {},
   playerSideFilter: 'both',
   currentPlayer: null,
   replayRounds: [],
@@ -21,6 +22,19 @@ const State = {
 };
 
 let replayEngine = null;
+const steamDebugEnabled = (() => {
+  try {
+    const qp = new URLSearchParams(window.location.search || '');
+    return qp.get('steamDebug') === '1';
+  } catch {
+    return false;
+  }
+})();
+
+function isLikelyHttpUrl(value) {
+  const v = String(value || '').trim();
+  return /^https?:\/\//i.test(v);
+}
 
 // â”€â”€ DOM helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 const $  = (sel) => document.querySelector(sel);
@@ -300,6 +314,7 @@ function resetDemoScopedState() {
   State.teamAnalysis = null;
   State.analyses = {};
   State.playerVisuals = {};
+  State.playerSteamProfiles = {};
   State.playerSideFilter = 'both';
   State.currentPlayer = null;
   State.replayRounds = [];
@@ -509,6 +524,52 @@ async function analyzePlayer(playerName) {
     if (!State.analyses[playerName]) {
       State.analyses[playerName] = await API.analyzePlayer(State.demoId, playerName);
     }
+    const cachedSteam = State.playerSteamProfiles[playerName] || null;
+    const steamAgeMs = cachedSteam ? (Date.now() - Number(cachedSteam._fetchedAt || 0)) : Number.POSITIVE_INFINITY;
+    const needsSteamFetch =
+      !cachedSteam ||
+      !cachedSteam.available ||
+      steamAgeMs > 5 * 60 * 1000;
+    if (needsSteamFetch) {
+      try {
+        const steamRes = await API.getPlayerSteamProfile(State.demoId, playerName, {
+          refresh: Boolean(cachedSteam && !cachedSteam.available),
+          debug: steamDebugEnabled,
+        });
+        State.playerSteamProfiles[playerName] = {
+          ...steamRes,
+          _fetchedAt: Date.now(),
+        };
+        if (steamDebugEnabled && steamRes?.debug) {
+          console.debug('[steam-profile-debug]', steamRes.debug);
+        }
+        if (!steamRes?.available) {
+          const prevReason = String(cachedSteam?.reason || '').trim();
+          const nextReason = String(steamRes?.reason || '').trim();
+          if (steamDebugEnabled || prevReason !== nextReason) {
+            console.warn('[steam-profile-unavailable]', {
+              player: playerName,
+              reason: nextReason || 'unknown',
+              steamid64: steamRes?.steamid64 || null,
+            });
+          }
+        }
+      } catch (steamErr) {
+        State.playerSteamProfiles[playerName] = {
+          player: playerName,
+          available: false,
+          steamid64: null,
+          personaname: playerName,
+          avatar_url: null,
+          profile_url: null,
+          reason: steamErr.message || 'steam_request_failed',
+          _fetchedAt: Date.now(),
+        };
+        if (steamDebugEnabled) {
+          console.error('[steam-profile-request-error]', steamErr);
+        }
+      }
+    }
     if (!State.playerVisuals[playerName]) {
       status.textContent = 'Rendering visuals...';
       try {
@@ -520,13 +581,18 @@ async function analyzePlayer(playerName) {
       }
     }
     status.textContent = '';
-    safeRenderPlayerBody(body, State.analyses[playerName], State.playerVisuals[playerName]);
+    safeRenderPlayerBody(
+      body,
+      State.analyses[playerName],
+      State.playerVisuals[playerName],
+      State.playerSteamProfiles[playerName] || null,
+    );
   } catch (err) {
     status.textContent = `Error: ${err.message}`;
   }
 }
 
-function renderPlayerBody(body, data, visuals = null) {
+function renderPlayerBody(body, data, visuals = null, steamProfile = null) {
   body.innerHTML = '';
 
   const stats = data.stats || {};
@@ -780,11 +846,33 @@ function renderPlayerBody(body, data, visuals = null) {
     else heroGroups.weak.push(cardHtml);
   });
 
+  const profile = steamProfile || {};
+  const avatarUrl = String(profile.avatar_url || '').trim();
+  const profileUrl = String(profile.profile_url || '').trim();
+  const hasAvatar = isLikelyHttpUrl(avatarUrl);
+  const hasProfileUrl = isLikelyHttpUrl(profileUrl);
+  const displayPlayerName = data.player || 'Player';
+  const personaName = typeof profile.personaname === 'string' ? profile.personaname.trim() : '';
+  const steamReason = String(profile.reason || '').trim();
+  const initial = (displayPlayerName || 'P').trim().charAt(0).toUpperCase();
+  const avatarHtml = hasAvatar
+    ? `<img class="player-hero-avatar" src="${avatarUrl}" alt="${displayPlayerName} avatar" loading="lazy" referrerpolicy="no-referrer" />`
+    : `<div class="player-hero-avatar-fallback">${initial}</div>`;
+  const profileBtnHtml = hasProfileUrl
+    ? `<a class="btn btn-secondary player-profile-btn" href="${profileUrl}" target="_blank" rel="noopener noreferrer">Player Profile</a>`
+    : `<button class="btn btn-secondary player-profile-btn" type="button" disabled title="Steam profile unavailable">Player Profile</button>`;
+
   topSection.innerHTML = `
     <div class="player-hero-head">
-      <div>
-        <h2 class="player-hero-title">${data.player || 'Player'}</h2>
+      <div class="player-hero-identity">
+        <div class="player-hero-avatar-wrap">${avatarHtml}</div>
+        <div class="player-hero-meta">
+          <h2 class="player-hero-title">${displayPlayerName}</h2>
+          ${personaName && personaName !== displayPlayerName ? `<div class="player-hero-persona">Steam: ${personaName}</div>` : ''}
+          ${!hasAvatar && steamReason ? `<div class="player-hero-persona">Steam unavailable: ${steamReason}</div>` : ''}
         <div class="player-hero-sub">${data.map || '-'} | ${selectedRounds || '-'} rounds | ${sideLabel}</div>
+          <div class="player-hero-profile-wrap">${profileBtnHtml}</div>
+        </div>
       </div>
       <div class="player-hero-rating ${ratingStatusClass}">
         <span>Rating</span>
@@ -938,7 +1026,7 @@ function renderPlayerBody(body, data, visuals = null) {
       const nextSide = btn.dataset.side || 'both';
       if (nextSide === State.playerSideFilter) return;
       State.playerSideFilter = nextSide;
-      safeRenderPlayerBody(body, data, visuals);
+      safeRenderPlayerBody(body, data, visuals, steamProfile);
     });
   });
 
@@ -1044,9 +1132,9 @@ function renderPlayerBody(body, data, visuals = null) {
   renderPlayerVisualsSection(body, visuals);
 }
 
-function safeRenderPlayerBody(body, data, visuals = null) {
+function safeRenderPlayerBody(body, data, visuals = null, steamProfile = null) {
   try {
-    renderPlayerBody(body, data, visuals);
+    renderPlayerBody(body, data, visuals, steamProfile);
   } catch (err) {
     console.error('Player body render failed:', err);
     if (body) {
@@ -1060,7 +1148,7 @@ function safeRenderPlayerBody(body, data, visuals = null) {
     if (State.playerSideFilter !== 'both') {
       State.playerSideFilter = 'both';
       try {
-        renderPlayerBody(body, data, visuals);
+        renderPlayerBody(body, data, visuals, steamProfile);
       } catch (fallbackErr) {
         console.error('Player body fallback render failed:', fallbackErr);
       }

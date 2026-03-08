@@ -57,6 +57,21 @@ const GRENADE_CONFIG = {
   decoy:      { color: '#a78bfa', glow: 'rgba(167,139,250,.4)', label: 'D',  r: 5 },
 };
 
+const GRENADE_FLIGHT_TICKS = {
+  smoke: 105,
+  flash: 78,
+  he_grenade: 90,
+  hegrenade: 90,
+  molotov: 112,
+  incendiary: 112,
+  decoy: 95,
+  unknown: 96,
+};
+
+const KILL_FLASH_TICKS = 320;
+const BOMB_FLASH_TICKS = 448;
+const GRENADE_IMPACT_TICKS = 256;
+
 // ── ReplayEngine ──────────────────────────────────────────────────────────────
 class ReplayEngine {
   /**
@@ -75,6 +90,9 @@ class ReplayEngine {
     this.kills    = data.kills    || [];
     this.bombs    = data.bombs    || [];
     this.grenades = data.grenades || [];
+    this.kills.sort((a, b) => (a.tick || 0) - (b.tick || 0));
+    this.bombs.sort((a, b) => (a.tick || 0) - (b.tick || 0));
+    this.grenades.sort((a, b) => (a.tick || 0) - (b.tick || 0));
     this.mapName  = data.map || 'de_mirage';
     this.mapInfo  = MAP_INFO[this.mapName] || MAP_INFO.de_mirage;
 
@@ -98,10 +116,10 @@ class ReplayEngine {
     // Active kill flashes
     this._activeKills = [];
 
-    // Active bomb icon
-    this._bombFlash = null;
+    // Active bomb icons
+    this._activeBombEvents = [];
 
-    // Active grenade icons: [{...g, cx, cy, _born}]
+    // Active grenade states
     this._activeGrenades = [];
 
     // Reset activation flags
@@ -153,7 +171,7 @@ class ReplayEngine {
       this._trails = {};
       this._activeKills = [];
       this._activeGrenades = [];
-      this._bombFlash = null;
+      this._activeBombEvents = [];
       this.kills.forEach(k    => { k._activated = false; });
       this.bombs.forEach(b    => { b._activated = false; });
       this.grenades.forEach(g => { g._activated = false; });
@@ -196,8 +214,6 @@ class ReplayEngine {
   // ── Event state update ───────────────────────────────────────────────────────
   _updateEventsForFrame() {
     const currentTick = this.frames[this.currentFrame]?.tick ?? 0;
-    const KILL_FLASH_FRAMES = 20;
-    const NADE_FLASH_FRAMES = 45;
 
     // Kills
     for (const k of this.kills) {
@@ -205,11 +221,11 @@ class ReplayEngine {
         k._activated = true;
         if (k.victim_x != null && k.victim_y != null) {
           const pos = worldToCanvas(k.victim_x, k.victim_y, this.mapInfo);
-          if (pos) this._activeKills.push({ ...k, ...pos, _born: this.currentFrame });
+          if (pos) this._activeKills.push({ ...k, ...pos });
         }
       }
     }
-    this._activeKills = this._activeKills.filter(k => this.currentFrame - k._born < KILL_FLASH_FRAMES);
+    this._activeKills = this._activeKills.filter(k => (currentTick - (k.tick || 0)) <= KILL_FLASH_TICKS);
 
     // Bomb events
     for (const b of this.bombs) {
@@ -217,20 +233,69 @@ class ReplayEngine {
         b._activated = true;
         if (b.x != null && b.y != null) {
           const pos = worldToCanvas(b.x, b.y, this.mapInfo);
-          if (pos) this._bombFlash = { ...b, ...pos, _born: this.currentFrame };
+          if (pos) this._activeBombEvents.push({ ...b, ...pos });
         }
       }
     }
+    this._activeBombEvents = this._activeBombEvents.filter(b => (currentTick - (b.tick || 0)) <= BOMB_FLASH_TICKS);
 
     // Grenades
     for (const g of this.grenades) {
       if (!g._activated && g.tick <= currentTick) {
         g._activated = true;
-        const pos = worldToCanvas(g.x, g.y, this.mapInfo);
-        if (pos) this._activeGrenades.push({ ...g, ...pos, _born: this.currentFrame });
+        const gType = (g.type || '').toLowerCase();
+        const flightTicks = Number.isFinite(g.flight_ticks) ? g.flight_ticks : (GRENADE_FLIGHT_TICKS[gType] || GRENADE_FLIGHT_TICKS.unknown);
+        const detTick = Number.isFinite(g.detonate_tick) ? g.detonate_tick : (g.tick + flightTicks);
+        this._activeGrenades.push({
+          ...g,
+          type: gType || 'unknown',
+          flight_ticks: flightTicks,
+          detonate_tick: detTick,
+        });
       }
     }
-    this._activeGrenades = this._activeGrenades.filter(g => this.currentFrame - g._born < NADE_FLASH_FRAMES);
+    this._activeGrenades = this._activeGrenades.filter(g => currentTick <= ((g.detonate_tick || g.tick) + GRENADE_IMPACT_TICKS));
+  }
+
+  _grenadePositionAtTick(g, currentTick) {
+    const throwTick = g.tick || 0;
+    const flightTicks = Math.max(1, g.flight_ticks || GRENADE_FLIGHT_TICKS[g.type] || GRENADE_FLIGHT_TICKS.unknown);
+    const detTick = g.detonate_tick || (throwTick + flightTicks);
+
+    const rawPath = Array.isArray(g.path) ? g.path : [];
+    const path = [];
+    for (const pt of rawPath) {
+      if (!Array.isArray(pt) || pt.length < 2) continue;
+      const x = Number(pt[0]);
+      const y = Number(pt[1]);
+      if (Number.isFinite(x) && Number.isFinite(y)) path.push([x, y]);
+    }
+
+    const sx = Number.isFinite(Number(g.start_x)) ? Number(g.start_x) : Number(g.x);
+    const sy = Number.isFinite(Number(g.start_y)) ? Number(g.start_y) : Number(g.y);
+    const ex = Number.isFinite(Number(g.end_x)) ? Number(g.end_x) : Number(g.x);
+    const ey = Number.isFinite(Number(g.end_y)) ? Number(g.end_y) : Number(g.y);
+
+    if (!path.length) {
+      if (Number.isFinite(sx) && Number.isFinite(sy)) path.push([sx, sy]);
+      if (Number.isFinite(ex) && Number.isFinite(ey)) path.push([ex, ey]);
+    }
+    if (path.length === 1) path.push(path[0]);
+    if (!path.length) return null;
+
+    if (currentTick >= detTick) {
+      return { wx: path[path.length - 1][0], wy: path[path.length - 1][1], phase: 'impact' };
+    }
+
+    const elapsed = Math.max(0, currentTick - throwTick);
+    const progress = Math.max(0, Math.min(1, elapsed / flightTicks));
+    const fidx = progress * (path.length - 1);
+    const i0 = Math.floor(fidx);
+    const i1 = Math.min(path.length - 1, i0 + 1);
+    const t = fidx - i0;
+    const wx = path[i0][0] + (path[i1][0] - path[i0][0]) * t;
+    const wy = path[i0][1] + (path[i1][1] - path[i0][1]) * t;
+    return { wx, wy, phase: 'flight' };
   }
 
   // ── Main draw ────────────────────────────────────────────────────────────────
@@ -251,6 +316,7 @@ class ReplayEngine {
 
     const frame = this.frames[this.currentFrame];
     if (!frame) return;
+    const currentTick = frame.tick ?? 0;
 
     const players = frame.players || [];
 
@@ -293,18 +359,18 @@ class ReplayEngine {
 
     // Draw grenade icons
     for (const g of this._activeGrenades) {
-      this._drawGrenade(ctx, g);
+      this._drawGrenade(ctx, g, currentTick);
     }
 
     // Draw kill markers
     for (const k of this._activeKills) {
-      this._drawKillMarker(ctx, k);
+      this._drawKillMarker(ctx, k, currentTick);
     }
 
-    // Draw bomb flash
-    if (this._bombFlash) {
-      const age = this.currentFrame - this._bombFlash._born;
-      if (age < 80) this._drawBombIcon(ctx, this._bombFlash, age);
+    // Draw bomb events
+    for (const b of this._activeBombEvents) {
+      const ageTicks = currentTick - (b.tick || currentTick);
+      if (ageTicks < BOMB_FLASH_TICKS) this._drawBombIcon(ctx, b, ageTicks);
     }
 
     // Draw players (dead first, alive on top)
@@ -408,9 +474,9 @@ class ReplayEngine {
     ctx.restore();
   }
 
-  _drawKillMarker(ctx, k) {
-    const age   = this.currentFrame - k._born;
-    const alpha = Math.max(0, 1 - age / 20);
+  _drawKillMarker(ctx, k, currentTick) {
+    const ageTicks = currentTick - (k.tick || currentTick);
+    const alpha = Math.max(0, 1 - ageTicks / KILL_FLASH_TICKS);
     const color = k.victim_side === 'CT' ? '#3b82f6' : '#f59e0b';
     const s = 6;
     ctx.save();
@@ -434,12 +500,12 @@ class ReplayEngine {
     ctx.restore();
   }
 
-  _drawBombIcon(ctx, b, age) {
-    const alpha = Math.max(0, 1 - age / 80);
+  _drawBombIcon(ctx, b, ageTicks) {
+    const alpha = Math.max(0, 1 - ageTicks / BOMB_FLASH_TICKS);
     const evt   = b.event || '';
     const isDefuse = evt.toLowerCase().includes('defus');
     const color = isDefuse ? '#22c55e' : '#ef4444';
-    const pulse = 1 + Math.sin(age * 0.3) * 0.15;
+    const pulse = 1 + Math.sin((ageTicks / 16) * 0.3) * 0.15;
     const r = 9 * pulse;
 
     ctx.save();
@@ -460,14 +526,24 @@ class ReplayEngine {
     ctx.restore();
   }
 
-  _drawGrenade(ctx, g) {
-    const age    = this.currentFrame - g._born;
-    const cfg    = GRENADE_CONFIG[g.type] || GRENADE_CONFIG.decoy;
-    const alpha  = Math.max(0, 1 - age / 45) * 0.9;
-    const expand = age < 10 ? (age / 10) * 1.3 : 1.0; // brief pop animation
+  _drawGrenade(ctx, g, currentTick) {
+    const state = this._grenadePositionAtTick(g, currentTick);
+    if (!state) return;
+    const pos = worldToCanvas(state.wx, state.wy, this.mapInfo);
+    if (!pos) return;
+
+    const cfg = GRENADE_CONFIG[g.type] || GRENADE_CONFIG.decoy;
+    const ageTicks = Math.max(0, currentTick - (g.tick || currentTick));
+    const expand = ageTicks < 32 ? (ageTicks / 32) * 1.3 : 1.0;
+
+    let alpha = 0.9;
+    if (state.phase === 'impact') {
+      const impactAge = currentTick - (g.detonate_tick || currentTick);
+      alpha = Math.max(0, 1 - impactAge / GRENADE_IMPACT_TICKS) * 0.95;
+    }
 
     ctx.save();
-    ctx.translate(g.cx, g.cy);
+    ctx.translate(pos.cx, pos.cy);
     ctx.globalAlpha = alpha;
 
     // Glow
@@ -498,8 +574,9 @@ class ReplayEngine {
     ctx.restore();
 
     // Thrower name (brief, only while fresh)
-    if (age < 12 && this.showLabels) {
-      const shortName = g.thrower.length > 8 ? g.thrower.substring(0, 8) + '…' : g.thrower;
+    if (ageTicks < 96 && this.showLabels) {
+      const thrower = String(g.thrower || '');
+      const shortName = thrower.length > 8 ? thrower.substring(0, 8) + '…' : thrower;
       ctx.save();
       ctx.globalAlpha = alpha * 0.8;
       ctx.font        = '9px Inter, sans-serif';
@@ -507,7 +584,7 @@ class ReplayEngine {
       ctx.fillStyle   = '#e8edf5';
       ctx.shadowColor = '#000';
       ctx.shadowBlur  = 3;
-      ctx.fillText(shortName, g.cx, g.cy - cfg.r - 4);
+      ctx.fillText(shortName, pos.cx, pos.cy - cfg.r - 4);
       ctx.restore();
     }
   }
