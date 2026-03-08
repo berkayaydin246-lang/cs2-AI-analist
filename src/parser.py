@@ -692,13 +692,34 @@ def _get_player_list(df: pd.DataFrame) -> list:
 
 
 def _normalize_steamid64(value) -> str | None:
+    """Convert any SteamID representation to a normalized SteamID64 string.
+
+    CRITICAL: Must NOT use float() as an intermediate step.
+    SteamID64 values (~7.6×10^16) exceed float64 precision (2^53 ≈ 9×10^15).
+    Using float() silently truncates the ID, e.g.:
+        int(float(76561198388732174)) == 76561198388732160  ← WRONG
+    This causes the Steam API to return a completely different player's profile.
+    """
+    if value is None or value == "":
+        return None
     try:
-        sval = str(int(float(value))).strip()
-    except (TypeError, ValueError):
+        if isinstance(value, str):
+            s = value.strip()
+            if not s or not s.isdigit():
+                return None
+            int_val = int(s)          # string → int: no precision loss
+        elif isinstance(value, float):
+            if value != value:        # NaN check
+                return None
+            int_val = int(value)      # float already lost precision, best effort
+        else:
+            int_val = int(value)      # int/numpy.int64/pandas.Int64: no precision loss
+    except (TypeError, ValueError, OverflowError):
         return None
+    if int_val <= 0:
+        return None
+    sval = str(int_val)
     if len(sval) < 16 or len(sval) > 20:
-        return None
-    if not sval.isdigit():
         return None
     return sval
 
