@@ -66,7 +66,7 @@ app.mount("/generated", StaticFiles(directory=str(GENERATED_DIR)), name="generat
 # In-memory session store: demo_id -> session dict
 _sessions: dict[str, dict[str, Any]] = {}
 MAX_SESSION_COUNT = 20
-REQUIRED_SCHEMA_VERSION = 9
+REQUIRED_SCHEMA_VERSION = 10
 STEAM_FAILURE_CACHE_TTL_SEC = 30
 
 

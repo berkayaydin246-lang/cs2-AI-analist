@@ -60,14 +60,16 @@ def parse_demo(demo_path: str) -> dict:
     print(f"[+] Kill sayÄ±sÄ± : {len(kills_df)}")
 
     player_positions = _process_ticks(ticks_df)
-    player_identities = _build_player_identities(player_positions)
+    # Process kills first so we can use attacker/victim steamid columns for identity mapping
+    kills_processed = _process_kills(kills_df)
+    player_identities = _build_player_identities(player_positions, kills=kills_processed)
 
     result = {
-        "schema_version": 9,
+        "schema_version": 10,
         "map":          map_name,
         "total_rounds": total_rounds,
         "map_bounds":   _extract_map_bounds(ticks_df),
-        "kills":        _process_kills(kills_df),
+        "kills":        kills_processed,
         "damages":      _process_damages(damages_df),
         "grenades":     _process_grenades(grenades_df),
         "bomb_events":  _process_bomb_events(bomb_df),
@@ -138,12 +140,25 @@ def _process_kills(df: pd.DataFrame) -> list:
                 rename_map[col] = "victim_x"
             elif col == "victim_Y":
                 rename_map[col] = "victim_y"
+            # SteamID64 per participant — used for identity mapping
+            elif cl in ("attacker_steamid", "attacker_steam_id", "killer_steamid",
+                        "attacker_id", "attacker_player_id"):
+                rename_map[col] = "attacker_steamid"
+            elif cl in ("victim_steamid", "victim_steam_id", "dead_steamid",
+                        "victim_id", "victim_player_id"):
+                rename_map[col] = "victim_steamid"
+            elif cl in ("assister_steamid", "assister_steam_id", "assist_steamid"):
+                rename_map[col] = "assister_steamid"
         if rename_map:
             df = df.rename(columns=rename_map)
 
-    keep = [c for c in ["attacker_name", "victim_name", "assister_name", "weapon",
-                        "headshot", "attacker_side", "victim_side",
-                        "tick", "victim_x", "victim_y", "round_num"] if c in df.columns]
+    keep = [c for c in [
+        "attacker_name", "victim_name", "assister_name", "weapon",
+        "headshot", "attacker_side", "victim_side",
+        "tick", "victim_x", "victim_y", "round_num",
+        # SteamID64 columns — kept for identity resolution
+        "attacker_steamid", "victim_steamid", "assister_steamid",
+    ] if c in df.columns]
     return df[keep].fillna("").to_dict(orient="records")
 
 
@@ -688,7 +703,7 @@ def _normalize_steamid64(value) -> str | None:
     return sval
 
 
-def _build_player_identities(player_positions: list) -> dict:
+def _build_player_identities(player_positions: list, kills: list | None = None) -> dict:
     """Build a dual-index identity structure keyed by SteamID64 (primary).
 
     Returns:
@@ -697,23 +712,44 @@ def _build_player_identities(player_positions: list) -> dict:
             "by_name":    {player_name: steamid64}   # reverse lookup; most-appeared wins
         }
 
-    Using steamid64 as primary key is correct because:
-    - player names can change during a match
-    - multiple players can share the same name
-    - steamid64 is unique and stable per account
-    """
-    if not player_positions:
-        return {"by_steamid": {}, "by_name": {}}
+    Data sources (in ascending reliability order):
+    1. player_positions (ticks) — many rows, steamid field may be missing in some awpy builds
+    2. kills — each row DIRECTLY pairs attacker/victim name with their steamid64,
+               much more reliable than ticks. Weighted 20x to dominate the vote.
 
-    # Count tick-level appearances per (name, steamid64) pair
+    Using steamid64 as primary key avoids wrong-profile issues when:
+    - players change names during a match
+    - multiple players share the same display name
+    - tick data has misaligned steamid columns
+    """
     pair_counts: dict[tuple[str, str], int] = {}
-    for row in player_positions:
+
+    # ── Source 1: player_positions (ticks) ────────────────────────────────────
+    for row in (player_positions or []):
         name = str(row.get("player_name") or "").strip()
         sid = _normalize_steamid64(row.get("steamid"))
         if not name or not sid:
             continue
-        key = (name, sid)
-        pair_counts[key] = pair_counts.get(key, 0) + 1
+        pair_counts[(name, sid)] = pair_counts.get((name, sid), 0) + 1
+
+    # ── Source 2: kills (primary — directly pairs name+steamid per event) ────
+    # Each kill event gives us two guaranteed (name, steamid64) pairs.
+    # Weight them much higher so they dominate over ticks when both are available.
+    KILL_WEIGHT = 20
+    for k in (kills or []):
+        for name_key, sid_key in (
+            ("attacker_name", "attacker_steamid"),
+            ("victim_name",   "victim_steamid"),
+            ("assister_name", "assister_steamid"),
+        ):
+            name = str(k.get(name_key) or "").strip()
+            sid = _normalize_steamid64(k.get(sid_key))
+            if not name or not sid:
+                continue
+            pair_counts[(name, sid)] = pair_counts.get((name, sid), 0) + KILL_WEIGHT
+
+    if not pair_counts:
+        return {"by_steamid": {}, "by_name": {}}
 
     # Primary index: steamid64 → most-common name for that steamid64
     by_steamid: dict[str, dict] = {}
@@ -722,7 +758,7 @@ def _build_player_identities(player_positions: list) -> dict:
         if prev is None or cnt > prev["appearances"]:
             by_steamid[sid] = {"player_name": name, "appearances": cnt}
 
-    # Reverse index: player_name → steamid64 (most-appeared steamid64 for that name)
+    # Reverse index: player_name → steamid64 (highest-vote steamid64 per name)
     name_best: dict[str, tuple[str, int]] = {}
     for (name, sid), cnt in pair_counts.items():
         prev = name_best.get(name)
@@ -730,9 +766,11 @@ def _build_player_identities(player_positions: list) -> dict:
             name_best[name] = (sid, cnt)
     by_name: dict[str, str] = {name: sid for name, (sid, _) in name_best.items()}
 
-    print(f"[+] Player identities: {len(by_steamid)} SteamID64s mapped")
-    for sid, info in by_steamid.items():
-        print(f"    SteamID64={sid}  name={info['player_name']!r}  appearances={info['appearances']}")
+    # Diagnostic log: show every resolved identity so wrong-mapping is easy to spot
+    kills_contributed = any(k.get("attacker_steamid") or k.get("victim_steamid") for k in (kills or []))
+    print(f"[+] Player identities: {len(by_steamid)} SteamID64s  (kills_source={kills_contributed})")
+    for sid, info in sorted(by_steamid.items(), key=lambda kv: -kv[1]["appearances"]):
+        print(f"    SteamID64={sid}  name={info['player_name']!r}  score={info['appearances']}")
 
     return {"by_steamid": by_steamid, "by_name": by_name}
 
