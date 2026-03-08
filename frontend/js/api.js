@@ -58,11 +58,15 @@ const API = (() => {
       return POST(`/api/demo/${demoId}/analyze/${encodeURIComponent(playerName)}`);
     },
 
-    /** Fetch Steam profile metadata for selected player (avatar/profile url) */
+    /** Fetch Steam profile metadata for selected player (avatar/profile url).
+     *  opts.steamid64  — when provided, the backend skips name-based lookup entirely,
+     *                    preventing wrong-profile issues from duplicate/changed names.
+     */
     getPlayerSteamProfile(demoId, playerName, opts = {}) {
       const refresh = opts.refresh ? 1 : 0;
       const debug = opts.debug ? 1 : 0;
-      return GET(`/api/demo/${demoId}/player/${encodeURIComponent(playerName)}/steam?refresh=${refresh}&debug=${debug}`);
+      const sid = opts.steamid64 ? `&steamid64=${encodeURIComponent(opts.steamid64)}` : '';
+      return GET(`/api/demo/${demoId}/player/${encodeURIComponent(playerName)}/steam?refresh=${refresh}&debug=${debug}${sid}`);
     },
 
     /** Get generated player visuals (heatmaps, utility map, route gif) */

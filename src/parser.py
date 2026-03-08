@@ -689,28 +689,52 @@ def _normalize_steamid64(value) -> str | None:
 
 
 def _build_player_identities(player_positions: list) -> dict:
-    identities = {}
-    if not player_positions:
-        return identities
+    """Build a dual-index identity structure keyed by SteamID64 (primary).
 
-    counts = {}
+    Returns:
+        {
+            "by_steamid": {steamid64: {"player_name": str, "appearances": int}},
+            "by_name":    {player_name: steamid64}   # reverse lookup; most-appeared wins
+        }
+
+    Using steamid64 as primary key is correct because:
+    - player names can change during a match
+    - multiple players can share the same name
+    - steamid64 is unique and stable per account
+    """
+    if not player_positions:
+        return {"by_steamid": {}, "by_name": {}}
+
+    # Count tick-level appearances per (name, steamid64) pair
+    pair_counts: dict[tuple[str, str], int] = {}
     for row in player_positions:
         name = str(row.get("player_name") or "").strip()
         sid = _normalize_steamid64(row.get("steamid"))
         if not name or not sid:
             continue
         key = (name, sid)
-        counts[key] = counts.get(key, 0) + 1
+        pair_counts[key] = pair_counts.get(key, 0) + 1
 
-    best_by_name = {}
-    for (name, sid), cnt in counts.items():
-        prev = best_by_name.get(name)
+    # Primary index: steamid64 → most-common name for that steamid64
+    by_steamid: dict[str, dict] = {}
+    for (name, sid), cnt in pair_counts.items():
+        prev = by_steamid.get(sid)
+        if prev is None or cnt > prev["appearances"]:
+            by_steamid[sid] = {"player_name": name, "appearances": cnt}
+
+    # Reverse index: player_name → steamid64 (most-appeared steamid64 for that name)
+    name_best: dict[str, tuple[str, int]] = {}
+    for (name, sid), cnt in pair_counts.items():
+        prev = name_best.get(name)
         if prev is None or cnt > prev[1]:
-            best_by_name[name] = (sid, cnt)
+            name_best[name] = (sid, cnt)
+    by_name: dict[str, str] = {name: sid for name, (sid, _) in name_best.items()}
 
-    for name, (sid, _) in best_by_name.items():
-        identities[name] = {"steamid64": sid}
-    return identities
+    print(f"[+] Player identities: {len(by_steamid)} SteamID64s mapped")
+    for sid, info in by_steamid.items():
+        print(f"    SteamID64={sid}  name={info['player_name']!r}  appearances={info['appearances']}")
+
+    return {"by_steamid": by_steamid, "by_name": by_name}
 
 
 def save_parsed_data(data: dict, output_path: str):

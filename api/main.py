@@ -194,8 +194,32 @@ def _normalize_steamid64(value: Any) -> str | None:
 
 
 def _extract_player_steamid64(parsed: dict, player_name: str) -> str | None:
+    """Resolve SteamID64 for a player name from parsed demo data.
+
+    Lookup order:
+    1. identities["by_name"]  — new dual-index structure (steamid64-primary)
+    2. identities legacy      — old name-keyed structure {name: {steamid64: str}}
+    3. Scan player_positions  — frequency vote fallback
+    """
     identities = parsed.get("player_identities", {})
-    if isinstance(identities, dict):
+
+    # ── New structure: {"by_steamid": {...}, "by_name": {...}} ────────────────
+    if isinstance(identities, dict) and "by_name" in identities:
+        by_name: dict = identities.get("by_name") or {}
+        # Exact name match
+        sid = _normalize_steamid64(by_name.get(player_name))
+        if sid:
+            return sid
+        # Case-insensitive fallback
+        lname = player_name.strip().lower()
+        for name, steamid in by_name.items():
+            if str(name).strip().lower() == lname:
+                sid = _normalize_steamid64(steamid)
+                if sid:
+                    return sid
+
+    # ── Legacy structure: {player_name: {"steamid64": str}} ──────────────────
+    elif isinstance(identities, dict):
         direct = identities.get(player_name)
         if isinstance(direct, dict):
             sid = _normalize_steamid64(direct.get("steamid64"))
@@ -210,6 +234,7 @@ def _extract_player_steamid64(parsed: dict, player_name: str) -> str | None:
                 if sid:
                     return sid
 
+    # ── Final fallback: vote on steamid field across player_positions ─────────
     counts: dict[str, int] = {}
     lname = player_name.strip().lower()
     for row in parsed.get("player_positions", []):
@@ -222,6 +247,29 @@ def _extract_player_steamid64(parsed: dict, player_name: str) -> str | None:
     if not counts:
         return None
     return max(counts.items(), key=lambda kv: kv[1])[0]
+
+
+def _build_player_steamids(parsed: dict) -> dict[str, str]:
+    """Return a flat {player_name → steamid64} map from parsed data."""
+    identities = parsed.get("player_identities", {})
+    result: dict[str, str] = {}
+    if not isinstance(identities, dict):
+        return result
+    # New structure
+    by_name = identities.get("by_name")
+    if isinstance(by_name, dict):
+        for name, val in by_name.items():
+            sid = _normalize_steamid64(val)
+            if sid:
+                result[name] = sid
+        return result
+    # Legacy structure: {name: {steamid64: str}}
+    for name, val in identities.items():
+        if isinstance(val, dict):
+            sid = _normalize_steamid64(val.get("steamid64"))
+            if sid:
+                result[name] = sid
+    return result
 
 
 def _fetch_steam_profile(steamid64: str) -> tuple[dict[str, Any] | None, str | None, dict[str, Any]]:
@@ -290,7 +338,16 @@ def parse(demo_id: str):
     s = _sess(demo_id)
     try:
         parsed = _ensure_session_parsed_schema(s, min_schema=REQUIRED_SCHEMA_VERSION)
-        return {"map": parsed["map"], "total_rounds": parsed["total_rounds"], "players": parsed["players"]}
+        player_steamids = _build_player_steamids(parsed)
+        print(f"[parse] player_steamids resolved: {len(player_steamids)} players")
+        for name, sid in player_steamids.items():
+            print(f"    name={name!r}  steamid64={sid}")
+        return {
+            "map": parsed["map"],
+            "total_rounds": parsed["total_rounds"],
+            "players": parsed["players"],
+            "player_steamids": player_steamids,
+        }
     except Exception as exc:
         raise HTTPException(500, detail=str(exc))
 
@@ -339,14 +396,34 @@ def analyze(demo_id: str, player_name: str):
 
 
 @app.get("/api/demo/{demo_id}/player/{player_name:path}/steam")
-def player_steam_profile(demo_id: str, player_name: str, refresh: int = 0, debug: int = 0):
+def player_steam_profile(
+    demo_id: str,
+    player_name: str,
+    steamid64: str = "",
+    refresh: int = 0,
+    debug: int = 0,
+):
     s = _sess(demo_id)
     parsed = _ensure_session_parsed_schema(s, min_schema=REQUIRED_SCHEMA_VERSION)
-    steamid64 = _extract_player_steamid64(parsed, player_name)
+
+    # Use caller-supplied SteamID64 when available — avoids name-based lookup entirely
+    sid_source = "param"
+    resolved = _normalize_steamid64(steamid64.strip()) if steamid64.strip() else None
+    if not resolved:
+        resolved = _extract_player_steamid64(parsed, player_name)
+        sid_source = "lookup"
+
+    # Always log: which player, which SteamID64, how it was resolved
+    print(f"[steam] Player: {player_name!r}  SteamID64: {resolved}  source={sid_source}")
+
+    # Rename to steamid64 for rest of function
+    steamid64 = resolved  # type: ignore[assignment]
+
     debug_info: dict[str, Any] = {
         "player": player_name,
         "has_steamid64": bool(steamid64),
         "steamid64": steamid64,
+        "sid_source": sid_source,
         "refresh_requested": bool(refresh),
         "schema_version": int(parsed.get("schema_version", 0)),
     }
@@ -362,7 +439,7 @@ def player_steam_profile(demo_id: str, player_name: str, refresh: int = 0, debug
         }
         if debug:
             resp["debug"] = debug_info
-            print(f"[steam] player={player_name} steamid64=none reason=steamid_not_found")
+        print(f"[steam] Player: {player_name!r}  SteamID64: none  reason=steamid_not_found")
         return resp
 
     steam_cache = s.setdefault("steam_profiles", {})
@@ -389,13 +466,11 @@ def player_steam_profile(demo_id: str, player_name: str, refresh: int = 0, debug
             "profile_url": cached.get("profile_url") or None,
             "reason": cached.get("reason") or None,
         }
+        profile_url_log = resp.get("profile_url") or "unavailable"
+        print(f"[steam] Player: {player_name!r}  SteamID64: {steamid64}  Profile: {profile_url_log}  (cache_hit)")
         if debug:
             debug_info["cache_hit"] = True
             resp["debug"] = debug_info
-            print(
-                f"[steam] player={player_name} steamid64={steamid64} cache_hit=1 "
-                f"available={int(bool(resp['profile_url']))} reason={resp['reason']}"
-            )
         return resp
 
     profile, err, fetch_meta = _fetch_steam_profile(steamid64)
@@ -415,14 +490,11 @@ def player_steam_profile(demo_id: str, player_name: str, refresh: int = 0, debug
             "profile_url": profile.get("profile_url") or None,
             "reason": None,
         }
+        print(f"[steam] Player: {player_name!r}  SteamID64: {steamid64}  Profile: {resp['profile_url'] or 'unavailable'}")
         if debug:
             debug_info["cache_hit"] = False
             debug_info.update(fetch_meta)
             resp["debug"] = debug_info
-            print(
-                f"[steam] player={player_name} steamid64={steamid64} cache_hit=0 "
-                f"available={int(bool(resp['profile_url']))} reason=none"
-            )
         return resp
 
     fallback = {
@@ -444,11 +516,11 @@ def player_steam_profile(demo_id: str, player_name: str, refresh: int = 0, debug
         "profile_url": None,
         "reason": err,
     }
+    print(f"[steam] Player: {player_name!r}  SteamID64: {steamid64}  Profile: unavailable  reason={err}")
     if debug:
         debug_info["cache_hit"] = False
         debug_info.update(fetch_meta)
         resp["debug"] = debug_info
-        print(f"[steam] player={player_name} steamid64={steamid64} cache_hit=0 available=0 reason={err}")
     return resp
 
 

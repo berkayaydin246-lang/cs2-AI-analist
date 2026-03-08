@@ -15,6 +15,8 @@ const State = {
   analyses:     {},
   playerVisuals: {},
   playerSteamProfiles: {},
+  /** {player_name → steamid64} resolved by the parser from demo tick data */
+  playerSteamIds: {},
   playerSideFilter: 'both',
   currentPlayer: null,
   replayRounds: [],
@@ -315,6 +317,7 @@ function resetDemoScopedState() {
   State.analyses = {};
   State.playerVisuals = {};
   State.playerSteamProfiles = {};
+  State.playerSteamIds = {};
   State.playerSideFilter = 'both';
   State.currentPlayer = null;
   State.replayRounds = [];
@@ -357,9 +360,14 @@ async function startUpload(file) {
     setStatus('Parsing demo - this may take 20-60 s...');
 
     const parsed = await API.parseDemo(State.demoId);
-    State.mapName     = parsed.map;
-    State.totalRounds = parsed.total_rounds;
-    State.players     = parsed.players || [];
+    State.mapName       = parsed.map;
+    State.totalRounds   = parsed.total_rounds;
+    State.players       = parsed.players || [];
+    // Store steamid64 per player — resolved directly from demo tick data (not by name)
+    State.playerSteamIds = parsed.player_steamids || {};
+    if (steamDebugEnabled) {
+      console.debug('[steam-ids] Resolved from demo:', State.playerSteamIds);
+    }
     setStep('step-parse', 'done');
     setStep('step-ready', 'active');
     setStatus('Ready!');
@@ -532,16 +540,24 @@ async function analyzePlayer(playerName) {
       steamAgeMs > 5 * 60 * 1000;
     if (needsSteamFetch) {
       try {
+        // Always pass steamid64 directly — avoids wrong-profile issues from name-based lookup
+        const knownSteamId = State.playerSteamIds[playerName] || '';
         const steamRes = await API.getPlayerSteamProfile(State.demoId, playerName, {
           refresh: Boolean(cachedSteam && !cachedSteam.available),
           debug: steamDebugEnabled,
+          steamid64: knownSteamId,
         });
         State.playerSteamProfiles[playerName] = {
           ...steamRes,
           _fetchedAt: Date.now(),
         };
-        if (steamDebugEnabled && steamRes?.debug) {
-          console.debug('[steam-profile-debug]', steamRes.debug);
+
+        // Debug log — always shown when steamDebugEnabled, otherwise only on failure
+        const resolvedSid = steamRes?.steamid64 || knownSteamId || 'unknown';
+        const profileUrl  = steamRes?.profile_url || 'unavailable';
+        if (steamDebugEnabled) {
+          console.debug('[steam-profile-debug]', steamRes.debug || {});
+          console.log(`[steam] Player: ${playerName}  SteamID64: ${resolvedSid}  Profile: ${profileUrl}`);
         }
         if (!steamRes?.available) {
           const prevReason = String(cachedSteam?.reason || '').trim();
@@ -549,8 +565,9 @@ async function analyzePlayer(playerName) {
           if (steamDebugEnabled || prevReason !== nextReason) {
             console.warn('[steam-profile-unavailable]', {
               player: playerName,
+              steamid64: resolvedSid,
+              profile_url: profileUrl,
               reason: nextReason || 'unknown',
-              steamid64: steamRes?.steamid64 || null,
             });
           }
         }
