@@ -30,15 +30,23 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
+import logging
+
+logger = logging.getLogger("cs2coach")
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE_DIR))
 load_dotenv(dotenv_path=BASE_DIR / ".env")
 
 from src.analyzer import analyze_player          # noqa: E402
+from src.clip_store import get_clip_record, list_all_clips, list_demo_clips, scan_clip_integrity  # noqa: E402
+from src.render_queue import RenderQueueManager  # noqa: E402
+from src.render_modes import RENDER_MODE_INGAME_CAPTURE  # noqa: E402
 from src.coach import get_coaching, get_scouting_report  # noqa: E402
 from src.parser import parse_demo                # noqa: E402
 from src.team_analyzer import analyze_team       # noqa: E402
 from src.utils import (                          # noqa: E402
+    atomic_json_write,
     create_round_route_gif,
     get_grenade_positions,
     get_player_movement_positions,
@@ -48,7 +56,10 @@ from src.utils import (                          # noqa: E402
 
 # â”€â”€ App setup â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-app = FastAPI(title="CS2 AI Coach", version="1.0.0")
+APP_VERSION = "2.0.0"
+app = FastAPI(title="CS2 AI Coach", version=APP_VERSION)
+
+MAX_UPLOAD_SIZE_MB = 2048
 
 app.add_middleware(
     CORSMiddleware,
@@ -66,8 +77,399 @@ app.mount("/generated", StaticFiles(directory=str(GENERATED_DIR)), name="generat
 # In-memory session store: demo_id -> session dict
 _sessions: dict[str, dict[str, Any]] = {}
 MAX_SESSION_COUNT = 20
-REQUIRED_SCHEMA_VERSION = 10
+
+
+
+# ── Startup validation ───────────────────────────────────────────────────────
+
+def _validate_environment() -> dict:
+    """Check the local environment and return a structured diagnostic summary."""
+    checks: list[dict] = []
+    cs2_port_hint = int(os.environ.get("CS2_NETCON_PORT", "2121") or 2121)
+
+    def _add_check(
+        name: str,
+        ok: bool,
+        detail: str,
+        *,
+        required: bool,
+        category: str,
+        hint: str | None = None,
+    ) -> None:
+        item = {
+            "name": name,
+            "ok": bool(ok),
+            "detail": detail,
+            "required": bool(required),
+            "category": category,
+        }
+        if not required:
+            item["optional"] = True
+        if hint:
+            item["hint"] = hint
+        checks.append(item)
+
+    # Python version
+    py = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+    _add_check(
+        "python",
+        sys.version_info >= (3, 10),
+        py,
+        required=True,
+        category="runtime",
+        hint="Use Python 3.10+",
+    )
+
+    # .env file
+    env_file = BASE_DIR / ".env"
+    _add_check(
+        "env_file",
+        env_file.exists(),
+        str(env_file),
+        required=False,
+        category="config",
+        hint="Copy .env.example to .env and configure keys/paths as needed",
+    )
+
+    # Core package imports (required)
+    for pkg_name in ("fastapi", "uvicorn", "awpy", "pandas"):
+        try:
+            __import__(pkg_name)
+            _add_check(
+                f"pkg_{pkg_name}",
+                True,
+                "import ok",
+                required=True,
+                category="dependencies",
+            )
+        except Exception:
+            _add_check(
+                f"pkg_{pkg_name}",
+                False,
+                "missing or import failed",
+                required=True,
+                category="dependencies",
+                hint="Run: pip install -r requirements.txt",
+            )
+
+    # Render package imports (required for clip rendering)
+    for pkg_name in ("cv2",):
+        try:
+            __import__(pkg_name)
+            _add_check(
+                f"pkg_{pkg_name}",
+                True,
+                "import ok",
+                required=True,
+                category="rendering",
+            )
+        except Exception:
+            _add_check(
+                f"pkg_{pkg_name}",
+                False,
+                "missing or import failed",
+                required=True,
+                category="rendering",
+                hint="Run: pip install -r requirements.txt",
+            )
+
+    # OBS package import (optional unless in-game capture is used)
+    try:
+        __import__("obsws_python")
+        _add_check(
+            "pkg_obsws_python",
+            True,
+            "import ok",
+            required=False,
+            category="ingame_capture",
+        )
+    except Exception:
+        _add_check(
+            "pkg_obsws_python",
+            False,
+            "missing or import failed",
+            required=False,
+            category="ingame_capture",
+            hint="Install obsws-python to use cs2_ingame_capture",
+        )
+
+    # Anthropic API key (optional for AI routes only)
+    key = os.environ.get("ANTHROPIC_API_KEY", "")
+    has_key = bool(key and key != "sk-ant-...")
+    _add_check(
+        "anthropic_api_key",
+        has_key,
+        "configured" if has_key else "missing",
+        required=False,
+        category="ai",
+        hint="Set ANTHROPIC_API_KEY in .env to enable coaching/scouting endpoints",
+    )
+
+    # Steam API key (optional)
+    steam_key = os.environ.get("STEAM_API_KEY", "")
+    _add_check(
+        "steam_api_key",
+        bool(steam_key),
+        "configured" if steam_key else "not set",
+        required=False,
+        category="integrations",
+        hint="Optional: set STEAM_API_KEY for avatars/profile links",
+    )
+
+    # Output directories
+    _add_check(
+        "output_dir",
+        GENERATED_DIR.is_dir(),
+        str(GENERATED_DIR),
+        required=True,
+        category="filesystem",
+        hint="Ensure outputs/generated is writable",
+    )
+
+    queue_dir = GENERATED_DIR / "queue"
+    _add_check(
+        "queue_dir",
+        queue_dir.exists() or GENERATED_DIR.exists(),
+        str(queue_dir),
+        required=True,
+        category="filesystem",
+        hint="Queue directory will be auto-created under outputs/generated/queue",
+    )
+
+    # Demo directory
+    demos = BASE_DIR / "demos"
+    _add_check(
+        "demos_dir",
+        demos.is_dir(),
+        str(demos),
+        required=True,
+        category="filesystem",
+        hint="Create demos directory or upload demos through UI",
+    )
+
+    # awpy maps (radar images)
+    try:
+        import awpy.data  # type: ignore
+        maps_ok = awpy.data.MAPS_DIR.is_dir() and any(awpy.data.MAPS_DIR.glob("*.png"))
+        _add_check(
+            "awpy_maps",
+            maps_ok,
+            str(awpy.data.MAPS_DIR) if maps_ok else "missing",
+            required=True,
+            category="dependencies",
+            hint="Run: awpy get maps",
+        )
+    except Exception:
+        _add_check(
+            "awpy_maps",
+            False,
+            "awpy not installed or maps missing",
+            required=True,
+            category="dependencies",
+            hint="Run: pip install -r requirements.txt and awpy get maps",
+        )
+
+    # Platform (Windows required only for in-game capture)
+    is_windows = sys.platform == "win32"
+    _add_check(
+        "platform",
+        True,
+        sys.platform,
+        required=True,
+        category="runtime",
+        hint=None if is_windows else "In-game capture currently requires Windows.",
+    )
+
+    # In-game capture config validation (optional)
+    try:
+        from src.cs2_config import build_cs2_config, validate_cs2_config
+        from src.obs_controller import build_obs_config, validate_obs_config
+
+        cs2_cfg = build_cs2_config()
+        cs2_diag = validate_cs2_config(cs2_cfg)
+        cs2_ok = all(item.get("level") != "error" for item in cs2_diag)
+        cs2_detail = "; ".join(item.get("message", "") for item in cs2_diag if item.get("level") == "error") or "config ok"
+        _add_check(
+            "cs2_config",
+            cs2_ok,
+            cs2_detail,
+            required=False,
+            category="ingame_capture",
+            hint=f"Set CS2_EXE and ensure launch options include -usercon -netconport {cs2_port_hint}",
+        )
+
+        obs_cfg = build_obs_config()
+        obs_diag = validate_obs_config(obs_cfg)
+        obs_ok = all(item.get("level") != "error" for item in obs_diag)
+        obs_detail = "; ".join(item.get("message", "") for item in obs_diag if item.get("level") == "error") or "config ok"
+        _add_check(
+            "obs_config",
+            obs_ok,
+            obs_detail,
+            required=False,
+            category="ingame_capture",
+            hint="Set OBS_WS_* values in .env if OBS is not on localhost:4455",
+        )
+    except Exception:
+        _add_check(
+            "ingame_capture_config",
+            False,
+            "could not validate CS2/OBS config",
+            required=False,
+            category="ingame_capture",
+            hint="Check CS2 and OBS configuration modules",
+        )
+
+    required_failures = [c for c in checks if c.get("required") and not c.get("ok")]
+    optional_failures = [c for c in checks if (not c.get("required")) and not c.get("ok")]
+
+    next_steps: list[str] = []
+    for item in required_failures + optional_failures:
+        hint = str(item.get("hint") or "").strip()
+        if hint and hint not in next_steps:
+            next_steps.append(hint)
+
+    return {
+        "status": "ok" if not required_failures else "degraded",
+        "version": APP_VERSION,
+        "checks": checks,
+        "required_failures": [c.get("name") for c in required_failures],
+        "optional_failures": [c.get("name") for c in optional_failures],
+        "operator_next_steps": next_steps,
+    }
+
+
+def _log_startup_summary() -> None:
+    env = _validate_environment()
+    logger.info("CS2 AI Coach %s starting — status: %s", APP_VERSION, env["status"])
+    for c in env["checks"]:
+        icon = "OK" if c["ok"] else ("--" if c.get("optional") else "!!")
+        logger.info("  [%s] %-20s %s", icon, c["name"], c["detail"])
+
+
+_log_startup_summary()
+
+
+# ── Render queue ──────────────────────────────────────────────────────────────
+_render_queue = RenderQueueManager(
+    persist_dir=GENERATED_DIR / "queue",
+    max_retries=int(os.getenv("RENDER_JOB_MAX_RETRIES", "1")),
+    lease_timeout_s=int(os.getenv("RENDER_JOB_LEASE_TIMEOUT_S", "120")),
+)
+
+
+def _demo_snapshot_path(demo_id: str) -> Path:
+    return GENERATED_DIR / "queue" / "snapshots" / f"{demo_id}.json"
+
+
+def _persist_demo_snapshot(demo_id: str, session: dict, parsed: dict) -> str:
+    """Persist demo context needed by the standalone render worker."""
+    snapshot = {
+        "demo_id": demo_id,
+        "demo_path": str(session.get("path") or ""),
+        "filename": str(session.get("filename") or ""),
+        "saved_at": time.time(),
+        "parsed_data": parsed,
+    }
+    path = _demo_snapshot_path(demo_id)
+    atomic_json_write(path, snapshot)
+    return str(path)
+
+
+REQUIRED_SCHEMA_VERSION = 12
 STEAM_FAILURE_CACHE_TTL_SEC = 30
+
+
+def _normalize_queue_render_request(payload: dict) -> tuple[str, dict]:
+    render_mode = str(payload.get("render_mode") or RENDER_MODE_INGAME_CAPTURE)
+    settings = payload.get("target_settings") if isinstance(payload.get("target_settings"), dict) else {}
+    settings = dict(settings or {})
+    if payload.get("render_preset"):
+        settings["render_preset"] = str(payload["render_preset"])
+    return render_mode, settings
+
+
+def _validate_queue_plans_for_render(demo_id: str, plans: list[dict], render_mode: str) -> None:
+    from src.capture_pipeline import validate_capture_environment
+    from src.render_modes import RENDER_MODE_INGAME_CAPTURE, validate_plan_for_mode
+
+    invalid: list[str] = []
+    for plan in plans:
+        result = validate_plan_for_mode(plan, render_mode)
+        if result.get("compatible"):
+            continue
+        title = str(plan.get("title") or plan.get("clip_plan_id") or "clip plan")
+        reason = "; ".join(result.get("warnings") or []) or f"{render_mode} is not supported"
+        fallback = result.get("fallback_mode")
+        if fallback:
+            reason = f"{reason}. Suggested fallback: {fallback}"
+        invalid.append(f"{title}: {reason}")
+
+    if invalid:
+        raise HTTPException(
+            400,
+            detail=f"Some clip plans cannot be queued for {render_mode}: {' | '.join(invalid[:4])}",
+        )
+
+    if render_mode != RENDER_MODE_INGAME_CAPTURE:
+        return
+
+    session = _sess(demo_id)
+    env_check = validate_capture_environment(
+        demo_path=session.get("path", "") or None,
+        output_dir=str(GENERATED_DIR / "clips"),
+        check_obs_connection=True,
+        check_cs2_process=True,
+    )
+    if env_check.blockers:
+        raise HTTPException(
+            400,
+            detail="In-game capture is not ready: " + "; ".join(env_check.blockers[:4]),
+        )
+
+
+def _partition_queue_plans_for_render(
+    demo_id: str,
+    plans: list[dict],
+    render_mode: str,
+) -> tuple[list[dict], list[str]]:
+    from src.render_modes import validate_plan_for_mode
+
+    compatible: list[dict] = []
+    invalid: list[str] = []
+    for plan in plans:
+        result = validate_plan_for_mode(plan, render_mode)
+        if result.get("compatible"):
+            compatible.append(plan)
+            continue
+        title = str(plan.get("title") or plan.get("clip_plan_id") or "clip plan")
+        reason = "; ".join(result.get("warnings") or []) or f"{render_mode} is not supported"
+        invalid.append(f"{title}: {reason}")
+
+    if compatible and render_mode == RENDER_MODE_INGAME_CAPTURE:
+        _validate_queue_plans_for_render(demo_id, compatible, render_mode)
+
+    return compatible, invalid
+
+
+def _enqueue_render_job_for_plan(
+    *,
+    demo_id: str,
+    session: dict,
+    parsed: dict,
+    clip_plan: dict,
+    render_mode: str,
+    settings: dict,
+):
+    snapshot_path = _persist_demo_snapshot(demo_id, session, parsed)
+    return _render_queue.enqueue(
+        demo_id=demo_id,
+        clip_plan_id=str(clip_plan.get("clip_plan_id") or ""),
+        render_mode=render_mode,
+        target_settings=settings,
+        clip_plan=clip_plan,
+        demo_snapshot_path=snapshot_path,
+    )
 
 
 # â”€â”€ Helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -337,23 +739,50 @@ def serve_index():
 
 # â”€â”€ Demo lifecycle â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
+@app.get("/api/health")
+def health():
+    """Environment health check — validates API keys, directories, dependencies."""
+    return _validate_environment()
+
+
 @app.post("/api/demo/upload")
 async def upload_demo(file: UploadFile = File(...)):
+    original_name = str(file.filename or "")
+    suffix = Path(original_name).suffix.lower()
+    if suffix != ".dem":
+        raise HTTPException(
+            400,
+            detail="Invalid file type. Upload a .dem file exported from Counter-Strike 2.",
+        )
+
     demo_id = uuid.uuid4().hex[:10]
-    suffix = Path(file.filename or "demo.dem").suffix or ".dem"
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix or ".dem")
     content = await file.read()
+    if not content:
+        tmp.close()
+        Path(tmp.name).unlink(missing_ok=True)
+        raise HTTPException(400, detail="Uploaded file is empty. Please choose a valid .dem file.")
+
+    size_mb = round(len(content) / 1_048_576, 1)
+    if size_mb > MAX_UPLOAD_SIZE_MB:
+        tmp.close()
+        Path(tmp.name).unlink(missing_ok=True)
+        raise HTTPException(
+            400,
+            detail=f"Demo file is too large ({size_mb} MB). Maximum supported upload is {MAX_UPLOAD_SIZE_MB} MB.",
+        )
+
     tmp.write(content)
     tmp.close()
     _sessions[demo_id] = {
         "path": tmp.name,
-        "filename": file.filename or "demo.dem",
-        "size_mb": round(len(content) / 1_048_576, 1),
+        "filename": original_name or "demo.dem",
+        "size_mb": size_mb,
         "created_at": time.time(),
         "last_access": time.time(),
     }
     _cleanup_sessions()
-    return {"demo_id": demo_id, "filename": file.filename, "size_mb": _sessions[demo_id]["size_mb"]}
+    return {"demo_id": demo_id, "filename": original_name, "size_mb": _sessions[demo_id]["size_mb"]}
 
 
 @app.post("/api/demo/{demo_id}/parse")
@@ -361,6 +790,7 @@ def parse(demo_id: str):
     s = _sess(demo_id)
     try:
         parsed = _ensure_session_parsed_schema(s, min_schema=REQUIRED_SCHEMA_VERSION)
+        _persist_demo_snapshot(demo_id, s, parsed)
         player_steamids = _build_player_steamids(parsed)
         print(f"[parse] player_steamids resolved: {len(player_steamids)} players")
         for name, sid in player_steamids.items():
@@ -370,9 +800,33 @@ def parse(demo_id: str):
             "total_rounds": parsed["total_rounds"],
             "players": parsed["players"],
             "player_steamids": player_steamids,
+            "highlight_count": int((parsed.get("highlight_summary") or {}).get("total_highlights", 0)),
+            "clip_plan_count": int((parsed.get("clip_plan_summary") or {}).get("total_clip_plans", 0)),
         }
     except Exception as exc:
-        raise HTTPException(500, detail=str(exc))
+        message = str(exc).strip() or exc.__class__.__name__
+        hints: list[str] = [
+            "Ensure the uploaded file is a valid CS2 .dem file.",
+            "If map images are missing, run: awpy get maps",
+        ]
+        lower = message.lower()
+        if "file" in lower and "not found" in lower:
+            hints.insert(0, "Re-upload the demo file and retry parsing.")
+        if "schema" in lower:
+            hints.insert(0, "Delete stale parsed output and re-parse the demo.")
+        if "awpy" in lower:
+            hints.insert(0, "Verify awpy installation: pip install -r requirements.txt")
+
+        raise HTTPException(
+            500,
+            detail={
+                "error": "Demo parse failed",
+                "message": message,
+                "demo_id": demo_id,
+                "filename": s.get("filename"),
+                "hints": hints,
+            },
+        )
 
 
 @app.get("/api/demo/{demo_id}/info")
@@ -384,6 +838,178 @@ def demo_info(demo_id: str):
         "map": p["map"],
         "total_rounds": p["total_rounds"],
         "players": p["players"],
+        "highlight_count": int((p.get("highlight_summary") or {}).get("total_highlights", 0)),
+        "clip_plan_count": int((p.get("clip_plan_summary") or {}).get("total_clip_plans", 0)),
+    }
+
+
+@app.get("/api/demo/{demo_id}/highlights")
+def demo_highlights(demo_id: str):
+    _, parsed = _parsed(demo_id)
+    return {
+        "summary": parsed.get("highlight_summary", {}),
+        "highlights": parsed.get("highlights", []),
+    }
+
+
+@app.get("/api/demo/{demo_id}/clip-plans")
+def demo_clip_plans(demo_id: str):
+    _, parsed = _parsed(demo_id)
+    return {
+        "summary": parsed.get("clip_plan_summary", {}),
+        "clip_plans": parsed.get("clip_plans", []),
+    }
+
+
+def _find_clip_plan(parsed: dict, clip_plan_id: str) -> dict | None:
+    for plan in parsed.get("clip_plans", []) or []:
+        if str(plan.get("clip_plan_id") or "") == clip_plan_id:
+            return plan
+    return None
+
+
+def _find_highlight(parsed: dict, highlight_id: str) -> dict | None:
+    if not highlight_id:
+        return None
+    for item in parsed.get("highlights", []) or []:
+        if str(item.get("highlight_id") or "") == highlight_id:
+            return item
+    return None
+
+
+def _summarize_clips(clips: list[dict]) -> dict:
+    by_type: dict[str, int] = {}
+    by_status: dict[str, int] = {}
+    missing_files = 0
+    for item in clips:
+        clip_type = str(item.get("clip_type") or "unknown")
+        status = str(item.get("status") or "unknown")
+        by_type[clip_type] = by_type.get(clip_type, 0) + 1
+        by_status[status] = by_status.get(status, 0) + 1
+        warnings = list(((item.get("metadata") or {}).get("validation_warnings")) or [])
+        if "missing_video_file" in warnings:
+            missing_files += 1
+    return {
+        "total_clips": len(clips),
+        "by_type": by_type,
+        "by_status": by_status,
+        "missing_files": missing_files,
+    }
+
+
+@app.get("/api/demo/{demo_id}/clips")
+def demo_clips(demo_id: str):
+    _parsed(demo_id)
+    clips = list_demo_clips(GENERATED_DIR, demo_id)
+    return {
+        "summary": _summarize_clips(clips),
+        "clips": clips,
+    }
+
+
+@app.get("/api/clips")
+def all_clips():
+    clips = list_all_clips(GENERATED_DIR)
+    return {
+        "summary": _summarize_clips(clips),
+        "clips": clips,
+    }
+
+
+@app.get("/api/clips/integrity")
+def clips_integrity():
+    """Scan all clip indexes for missing files and stale references."""
+    return scan_clip_integrity(GENERATED_DIR)
+
+
+@app.get("/api/clips/{clip_id}")
+def clip_detail(clip_id: str, demo_id: str | None = None):
+    clip = get_clip_record(GENERATED_DIR, clip_id, demo_id=demo_id)
+    if not clip:
+        raise HTTPException(404, detail=f"Clip not found: {clip_id}")
+    return {"clip": clip}
+
+
+@app.get("/api/render-modes")
+def list_render_modes():
+    """Return available and known render modes."""
+    from src.render_modes import SUPPORTED_RENDER_MODES, get_available_render_modes
+    return {
+        "available": get_available_render_modes(),
+        "all": {
+            mode: {
+                "label": info["label"],
+                "available": info["available"],
+                "deprecated": bool(info.get("deprecated")),
+                "description": info.get("description", ""),
+                "requires_game_client": info.get("requires_game_client", False),
+                "output_format": info.get("output_format", "mp4"),
+            }
+            for mode, info in SUPPORTED_RENDER_MODES.items()
+        },
+    }
+
+
+@app.get("/api/render-presets")
+def list_render_presets():
+    """Return available render quality presets."""
+    from src.render_presets import RENDER_PRESETS, DEFAULT_PRESET
+    return {
+        "default": DEFAULT_PRESET,
+        "presets": {
+            name: {
+                "label": p["label"],
+                "description": p["description"],
+                "quality_tier": p["quality_tier"],
+                "capture_profile": p.get("capture_profile", "default"),
+            }
+            for name, p in RENDER_PRESETS.items()
+        },
+    }
+
+
+@app.get("/api/render-info")
+def render_info():
+    """Return the full render capability matrix: modes + presets + capture profiles."""
+    from src.render_modes import get_render_capability_matrix
+    from src.render_presets import RENDER_PRESETS, DEFAULT_PRESET
+    matrix = get_render_capability_matrix()
+    matrix["presets"] = {
+        name: {
+            "label": p["label"],
+            "description": p["description"],
+            "quality_tier": p["quality_tier"],
+            "capture_profile": p.get("capture_profile", "default"),
+            "hud_preference": p.get("hud_preference", "default"),
+        }
+        for name, p in RENDER_PRESETS.items()
+    }
+    matrix["default_preset"] = DEFAULT_PRESET
+    return matrix
+
+
+@app.post("/api/demo/{demo_id}/clips/render/{clip_plan_id}")
+def render_demo_clip(demo_id: str, clip_plan_id: str, payload: dict | None = None):
+    s, parsed = _parsed(demo_id)
+    clip_plan = _find_clip_plan(parsed, clip_plan_id)
+    if not clip_plan:
+        raise HTTPException(404, detail=f"Clip plan not found: {clip_plan_id}")
+
+    payload = payload or {}
+    render_mode, settings = _normalize_queue_render_request(payload)
+    _validate_queue_plans_for_render(demo_id, [clip_plan], render_mode)
+    job = _enqueue_render_job_for_plan(
+        demo_id=demo_id,
+        session=s,
+        parsed=parsed,
+        clip_plan=clip_plan,
+        render_mode=render_mode,
+        settings=settings,
+    )
+    return {
+        "status": "queued",
+        "message": f"Render job queued. Poll /api/queue or /api/queue/job/{job.job_id} for progress and /api/demo/{demo_id}/clips for completed artifacts.",
+        "job": job.to_dict(),
     }
 
 
@@ -957,4 +1583,416 @@ def scouting(demo_id: str, target_team: str):
         return {"report": report, "team": target_team}
     except Exception as exc:
         raise HTTPException(500, detail=str(exc))
+
+
+# ── In-game playback automation ──────────────────────────────────────────────
+
+@app.get("/api/ingame/status")
+def ingame_status():
+    """Check CS2 installation and process status."""
+    from src.cs2_controller import CS2Controller
+    ctrl = CS2Controller()
+    try:
+        return ctrl.get_diagnostics()
+    finally:
+        ctrl.close()
+
+
+@app.post("/api/demo/{demo_id}/ingame/prepare/{clip_plan_id}")
+def ingame_prepare_playback(demo_id: str, clip_plan_id: str, payload: dict | None = None):
+    """Prepare CS2 demo playback for a clip plan.
+
+    This triggers the local CS2 automation to:
+      - ensure CS2 is running
+      - load the demo
+      - seek to the clip window
+      - apply the requested camera strategy
+
+    It does NOT start recording — that is a future phase.
+    """
+    from src.cs2_playback import build_playback_job, prepare_playback, validate_playback_job
+
+    s, parsed = _parsed(demo_id)
+    clip_plan = _find_clip_plan(parsed, clip_plan_id)
+    if not clip_plan:
+        raise HTTPException(404, detail=f"Clip plan not found: {clip_plan_id}")
+
+    # Resolve demo path
+    demo_path = s.get("path", "")
+    if not demo_path or not Path(demo_path).is_file():
+        raise HTTPException(400, detail="Demo file not available in session")
+
+    payload = payload or {}
+    camera_overrides = payload.get("camera_overrides") if isinstance(payload.get("camera_overrides"), dict) else None
+    skip_launch = bool(payload.get("skip_launch", False))
+    config_overrides = payload.get("config") if isinstance(payload.get("config"), dict) else None
+
+    job = build_playback_job(demo_path, clip_plan, camera_overrides=camera_overrides)
+
+    # Pre-validate and return early if demo is missing
+    pre_warnings = validate_playback_job(job)
+    blocking = [w for w in pre_warnings if "not found" in w.lower() and "demo" in w.lower()]
+    if blocking:
+        raise HTTPException(400, detail=f"Playback validation failed: {'; '.join(blocking)}")
+
+    result = prepare_playback(job, config=config_overrides, skip_launch=skip_launch)
+    return result.to_dict()
+
+
+@app.get("/api/ingame/obs-status")
+def obs_status():
+    """Check OBS Studio connection status and readiness for capture."""
+    from src.obs_controller import OBSController, OBSStatus, build_obs_config, validate_obs_config
+
+    config = build_obs_config()
+    validation = validate_obs_config(config)
+
+    ctrl = OBSController(config)
+    try:
+        conn_status = ctrl.connect()
+        if conn_status != OBSStatus.CONNECTED:
+            return {
+                "connected": False,
+                "status": conn_status.value,
+                "config_validation": validation,
+                "diagnostics": None,
+                "hint": "Ensure OBS Studio 28+ is running with WebSocket Server enabled (Tools → obs-websocket Settings).",
+            }
+        diag = ctrl.get_diagnostics()
+        return {
+            "connected": True,
+            "status": "ready",
+            "config_validation": validation,
+            "diagnostics": diag,
+        }
+    except Exception as exc:
+        return {
+            "connected": False,
+            "status": "error",
+            "config_validation": validation,
+            "diagnostics": None,
+            "error": str(exc),
+        }
+    finally:
+        ctrl.disconnect()
+
+
+@app.get("/api/ingame/health")
+def ingame_health(demo_id: str | None = None):
+    """Comprehensive health check for local in-game capture readiness.
+
+    Validates: platform, CS2 executable, CS2 process, OBS connection,
+    demo file (if demo_id provided), output directory writability.
+
+    Returns structured readiness: ready / partially_ready / blocked,
+    plus a ready_for_capture boolean, per-component diagnostics, and
+    the total time the check took.
+    """
+    import time as _time
+    from src.capture_pipeline import validate_capture_environment
+    from src.cs2_config import build_cs2_config
+    from src.cs2_controller import CS2Controller
+    from src.obs_controller import OBSController, OBSStatus, build_obs_config
+
+    t0 = _time.monotonic()
+    netcon_port = int(build_cs2_config().get("netcon_port") or 2121)
+
+    demo_path = None
+    if demo_id:
+        try:
+            s = _sess(demo_id)
+            demo_path = s.get("path", "")
+        except Exception:
+            pass
+
+    env_check = validate_capture_environment(
+        demo_path=demo_path,
+        output_dir=str(GENERATED_DIR / "clips"),
+        check_obs_connection=True,
+        check_cs2_process=True,
+    )
+    result = env_check.to_dict()
+
+    # ── CS2 detailed diagnostics ──────────────────────────────────────────
+    try:
+        ctrl = CS2Controller()
+        cs2_diag = ctrl.get_diagnostics()
+        ctrl.close()
+    except Exception as exc:
+        cs2_diag = {"error": str(exc)}
+    result["cs2_diagnostics"] = cs2_diag
+
+    # ── OBS detailed diagnostics ──────────────────────────────────────────
+    obs_diag: dict = {}
+    try:
+        obs_cfg = build_obs_config()
+        obs_ctrl = OBSController(obs_cfg)
+        conn = obs_ctrl.connect()
+        if conn == OBSStatus.CONNECTED:
+            obs_diag = obs_ctrl.get_diagnostics()
+            obs_ctrl.disconnect()
+        else:
+            obs_diag = {"status": conn.value, "connected": False}
+    except Exception as exc:
+        obs_diag = {"error": str(exc)}
+    result["obs_diagnostics"] = obs_diag
+
+    next_actions: list[str] = []
+    for blocker in result.get("blockers", []):
+        text = str(blocker)
+        if "CS2 executable" in text:
+            next_actions.append("Set CS2_EXE in .env to your local cs2.exe path.")
+        elif "netcon" in text.lower():
+            next_actions.append(
+                f"Launch CS2 with -usercon -netconport {netcon_port} and verify netcon can connect before rendering."
+            )
+        elif "OBS" in text:
+            next_actions.append("Start OBS Studio and enable WebSocket Server (Tools -> obs-websocket Settings).")
+        elif "Demo file" in text:
+            next_actions.append("Upload and parse a demo before running in-game capture readiness for that demo.")
+        elif "Output directory" in text:
+            next_actions.append("Ensure outputs/generated/clips exists and is writable.")
+        else:
+            next_actions.append(text)
+
+    for warning in result.get("warnings", []):
+        w = str(warning)
+        if "CS2 not running" in w:
+            next_actions.append("Launch CS2 before capturing, or let the renderer auto-launch it.")
+        elif "command transport" in w:
+            next_actions.append(f"Add CS2 launch options: -usercon -netconport {netcon_port}")
+
+    result["next_actions"] = sorted(set(next_actions))
+    result["demo_context"] = {
+        "demo_id": demo_id,
+        "demo_path": demo_path,
+    }
+    result["check_duration_ms"] = round((_time.monotonic() - t0) * 1000, 1)
+    return result
+
+
+@app.get("/api/local/doctor")
+def local_doctor(demo_id: str | None = None):
+    """End-to-end local operator validation summary.
+
+    Combines app health, in-game readiness, queue status, and clip integrity
+    into one practical response for local setup validation.
+    """
+    app_health = _validate_environment()
+    ingame = ingame_health(demo_id=demo_id)
+    queue = _render_queue.get_status()
+    integrity = scan_clip_integrity(GENERATED_DIR)
+    stale_indexes = integrity.get("stale_indexes", [])
+
+    blockers: list[str] = []
+    if app_health.get("status") != "ok":
+        blockers.extend([f"app:{name}" for name in app_health.get("required_failures", [])])
+    if not bool(ingame.get("ready_for_capture", False)):
+        blockers.extend([f"ingame:{b}" for b in ingame.get("blockers", [])])
+    if isinstance(stale_indexes, list) and stale_indexes:
+        blockers.append("clip_indexes:stale_index_files")
+
+    overall_ready = len(blockers) == 0
+    next_actions = []
+    next_actions.extend(app_health.get("operator_next_steps", []))
+    next_actions.extend(ingame.get("next_actions", []))
+    if int(integrity.get("missing_video", 0)) > 0:
+        next_actions.append("Run GET /api/clips/integrity and clean or re-render clips with missing files.")
+    if int(queue.get("failed_count", 0)) > 0:
+        next_actions.append("Retry failed queue jobs via /api/queue/retry-all-failed or clear completed/failed state.")
+
+    return {
+        "status": "ready" if overall_ready else "attention_required",
+        "ready_for_local_use": overall_ready,
+        "blockers": blockers,
+        "next_actions": sorted(set(str(x) for x in next_actions if x)),
+        "app_health": app_health,
+        "ingame_health": {
+            "readiness": ingame.get("readiness"),
+            "ready_for_capture": ingame.get("ready_for_capture"),
+            "blockers": ingame.get("blockers", []),
+            "warnings": ingame.get("warnings", []),
+        },
+        "queue_summary": {
+            "queue_size": queue.get("queue_size", 0),
+            "active_count": queue.get("active_count", 0),
+            "failed_count": queue.get("failed_count", 0),
+            "completed_count": queue.get("completed_count", 0),
+        },
+        "clip_integrity": {
+            "total_clips": integrity.get("total_clips", 0),
+            "ok": integrity.get("ok", 0),
+            "missing_video": integrity.get("missing_video", 0),
+            "missing_thumbnail": integrity.get("missing_thumbnail", 0),
+            "missing_artifact_metadata": integrity.get("missing_artifact_metadata", 0),
+            "stale_queue_refs": integrity.get("stale_queue_refs", 0),
+        },
+    }
+
+
+# ── Render queue endpoints ────────────────────────────────────────────────────
+
+
+@app.get("/api/queue")
+def queue_status():
+    """Full queue status with all jobs."""
+    return _render_queue.get_status()
+
+
+@app.post("/api/queue/enqueue")
+def queue_enqueue(payload: dict):
+    """Enqueue a single render job.
+
+    Body: {demo_id, clip_plan_id, render_mode?, target_settings?}
+    """
+    demo_id = str(payload.get("demo_id") or "")
+    clip_plan_id = str(payload.get("clip_plan_id") or "")
+    if not demo_id or not clip_plan_id:
+        raise HTTPException(400, detail="demo_id and clip_plan_id required")
+
+    session, parsed = _parsed(demo_id)
+    clip_plan = _find_clip_plan(parsed, clip_plan_id)
+    if not clip_plan:
+        raise HTTPException(404, detail=f"Clip plan not found: {clip_plan_id}")
+
+    render_mode, settings = _normalize_queue_render_request(payload)
+    _validate_queue_plans_for_render(demo_id, [clip_plan], render_mode)
+    job = _enqueue_render_job_for_plan(
+        demo_id=demo_id,
+        session=session,
+        parsed=parsed,
+        clip_plan=clip_plan,
+        render_mode=render_mode,
+        settings=settings,
+    )
+    return job.to_dict()
+
+
+@app.post("/api/queue/enqueue-batch")
+def queue_enqueue_batch(payload: dict):
+    """Enqueue multiple render jobs at once.
+
+    Body: {demo_id, clip_plan_ids: [...], render_mode?, target_settings?}
+    OR:   {demo_id, mode: "top", count: N, render_mode?, target_settings?}
+    OR:   {demo_id, mode: "all", render_mode?, target_settings?}
+    """
+    demo_id = str(payload.get("demo_id") or "")
+    if not demo_id:
+        raise HTTPException(400, detail="demo_id required")
+
+    session, parsed = _parsed(demo_id)
+    all_plans = parsed.get("clip_plans", []) or []
+    snapshot_path = _persist_demo_snapshot(demo_id, session, parsed)
+    render_mode, settings = _normalize_queue_render_request(payload)
+
+    mode = str(payload.get("mode") or "selected")
+    clip_plan_ids = payload.get("clip_plan_ids", [])
+
+    if mode == "top":
+        count = max(1, min(50, int(payload.get("count", 5))))
+        sorted_plans = sorted(all_plans, key=lambda p: float(p.get("score", 0)), reverse=True)
+        plans = sorted_plans[:count]
+    elif mode == "all":
+        plans = list(all_plans)
+    elif mode == "failed":
+        # Re-queue failed jobs instead
+        retried = _render_queue.retry_all_failed()
+        return {"retried_count": retried, "jobs": []}
+    else:
+        # "selected" — use clip_plan_ids
+        if not isinstance(clip_plan_ids, list) or not clip_plan_ids:
+            raise HTTPException(400, detail="clip_plan_ids required for selected mode")
+        id_set = set(str(x) for x in clip_plan_ids)
+        plans = [p for p in all_plans if str(p.get("clip_plan_id", "")) in id_set]
+
+    if not plans:
+        raise HTTPException(400, detail="No clip plans matched")
+
+    compatible_plans, invalid_reasons = _partition_queue_plans_for_render(demo_id, plans, render_mode)
+    if not compatible_plans:
+        raise HTTPException(
+            400,
+            detail=f"Some clip plans cannot be queued for {render_mode}: {' | '.join(invalid_reasons[:4])}",
+        )
+
+    jobs = _render_queue.enqueue_batch(
+        demo_id=demo_id,
+        clip_plans=compatible_plans,
+        render_mode=render_mode,
+        target_settings=settings,
+        demo_snapshot_path=snapshot_path,
+    )
+    return {
+        "enqueued_count": len(jobs),
+        "skipped_count": len(invalid_reasons),
+        "skipped_reasons": invalid_reasons[:10],
+        "jobs": [j.to_dict() for j in jobs],
+    }
+
+
+@app.post("/api/queue/cancel/{job_id}")
+def queue_cancel(job_id: str):
+    """Cancel a queued or running job."""
+    job = _render_queue.cancel(job_id)
+    if not job:
+        raise HTTPException(404, detail=f"Job not found: {job_id}")
+    return job.to_dict()
+
+
+@app.post("/api/queue/cancel-all")
+def queue_cancel_all():
+    """Cancel all queued (pending) jobs."""
+    count = _render_queue.cancel_all_queued()
+    return {"cancelled_count": count}
+
+
+@app.post("/api/queue/retry/{job_id}")
+def queue_retry(job_id: str):
+    """Retry a failed or cancelled job."""
+    job = _render_queue.retry(job_id)
+    if not job:
+        raise HTTPException(404, detail=f"Job not found or not retryable: {job_id}")
+    return job.to_dict()
+
+
+@app.post("/api/queue/retry-all-failed")
+def queue_retry_all_failed():
+    """Retry all failed jobs."""
+    count = _render_queue.retry_all_failed()
+    return {"retried_count": count}
+
+
+@app.post("/api/queue/clear-completed")
+def queue_clear_completed():
+    """Remove completed and cancelled jobs from the queue list."""
+    count = _render_queue.clear_completed()
+    return {"removed_count": count}
+
+
+@app.post("/api/queue/clear-failed")
+def queue_clear_failed():
+    """Remove failed jobs from the queue list."""
+    count = _render_queue.clear_failed()
+    return {"removed_count": count}
+
+
+@app.get("/api/queue/job/{job_id}")
+def queue_job_detail(job_id: str):
+    """Get a single queue job's details."""
+    job = _render_queue.get_job(job_id)
+    if not job:
+        raise HTTPException(404, detail=f"Job not found: {job_id}")
+    return job.to_dict()
+
+
+@app.get("/api/queue/job/{job_id}/events")
+def queue_job_events(job_id: str, limit: int = 200):
+    """Get structured persistent event logs for a queue job."""
+    job = _render_queue.get_job(job_id)
+    if not job:
+        raise HTTPException(404, detail=f"Job not found: {job_id}")
+    return {
+        "job_id": job_id,
+        "events": _render_queue.get_job_events(job_id, limit=max(1, min(1000, int(limit)))),
+    }
 

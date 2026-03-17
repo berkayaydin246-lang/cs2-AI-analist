@@ -581,6 +581,47 @@ def build_replay_data(
         "rounds": rounds,
     }
 
+
+def build_round_replay_data(
+    parsed_data: dict[str, Any],
+    map_name: str,
+    round_num: int,
+    max_frames: int = MAX_FRAMES_PER_ROUND,
+) -> dict[str, Any]:
+    replay_data = build_replay_data(
+        parsed_data=parsed_data,
+        map_name=map_name,
+        max_frames_per_round=max_frames,
+    )
+    round_data = replay_data.get("rounds", {}).get(round_num, {})
+    frames = round_data.get("frames", [])
+    if not frames:
+        return {
+            "map": map_name,
+            "round": round_num,
+            "frames": [],
+            "events": [],
+            "start_tick": 0,
+            "end_tick": 0,
+            "duration_s": 0.0,
+            "tick_range": [0, 0],
+            "frame_count": 0,
+        }
+
+    start_tick = _safe_int(round_data.get("start_tick"), _safe_int(frames[0].get("tick"), 0))
+    end_tick = _safe_int(round_data.get("end_tick"), _safe_int(frames[-1].get("tick"), start_tick))
+    return {
+        "map": map_name,
+        "round": round_num,
+        "frames": frames,
+        "events": round_data.get("events", []),
+        "start_tick": start_tick,
+        "end_tick": end_tick,
+        "duration_s": float(round_data.get("duration_s", 0.0)),
+        "tick_range": [start_tick, end_tick],
+        "frame_count": len(frames),
+    }
+
 def _build_site_annotations(map_name: str) -> list[dict[str, Any]]:
     labels = SITE_LABELS_WORLD.get(map_name, {})
     annotations = []
