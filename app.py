@@ -35,7 +35,7 @@ from src.utils import (
 )
 
 
-REQUIRED_SCHEMA_VERSION = 8
+REQUIRED_SCHEMA_VERSION = 12
 
 
 st.set_page_config(page_title="CS2 AI Coach", page_icon="CS2", layout="wide")

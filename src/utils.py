@@ -1,10 +1,13 @@
 """
 utils.py
-Yardımcı fonksiyonlar — heatmap, dosya işlemleri vb.
+Shared utility functions — heatmap, file operations, asset helpers, etc.
 """
 
 import os
 import json
+import re
+import tempfile
+import time
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.lines import Line2D
@@ -13,6 +16,68 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 from PIL import Image
+
+
+# ── Asset / path helpers ──────────────────────────────────────────────────────
+
+def safe_slug(value: str) -> str:
+    """Convert an arbitrary string into a filesystem-safe slug."""
+    slug = re.sub(r"[^a-zA-Z0-9_-]+", "_", str(value or "").strip())
+    return slug.strip("_") or "default"
+
+
+def generated_url(path: str | Path | None) -> str | None:
+    """Convert an absolute filesystem path under outputs/generated/ to a
+    static-file URL that the frontend can fetch via /generated/...
+
+    Returns None if the path doesn't contain a 'generated' directory component.
+    """
+    if not path:
+        return None
+    parts = Path(path).parts
+    if "generated" not in parts:
+        return None
+    idx = parts.index("generated")
+    rel = "/".join(parts[idx + 1:])
+    return f"/generated/{rel}" if rel else "/generated"
+
+
+def atomic_json_write(path: Path, payload: dict | list, *, indent: int = 2, retries: int = 8) -> None:
+    """Write JSON atomically with Windows-friendly replace retries."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=str(path.parent),
+            prefix=f"{path.stem}.",
+            suffix=".tmp",
+            delete=False,
+        ) as fh:
+            fh.write(json.dumps(payload, ensure_ascii=False, indent=indent))
+            fh.flush()
+            os.fsync(fh.fileno())
+            tmp_path = Path(fh.name)
+
+        last_exc: Exception | None = None
+        for attempt in range(max(1, int(retries))):
+            try:
+                os.replace(str(tmp_path), str(path))
+                tmp_path = None
+                return
+            except PermissionError as exc:
+                last_exc = exc
+                time.sleep(min(0.05 * (attempt + 1), 0.5))
+        if last_exc:
+            raise last_exc
+    except BaseException:
+        try:
+            if tmp_path is not None:
+                tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 _MAP_INFO = {

@@ -105,6 +105,7 @@ class ReplayEngine {
 
     this.showTrails = true;
     this.showLabels = true;
+    this.playbackWindow = null;
 
     // Trail history: playerName -> [{cx,cy}]
     this._trails = {};
@@ -147,6 +148,9 @@ class ReplayEngine {
   // ── Playback controls ────────────────────────────────────────────────────────
   play() {
     if (this.playing) return;
+    if (this.playbackWindow && this.currentFrame >= this.playbackWindow.endFrame) {
+      this.seekTo(this.playbackWindow.startFrame);
+    }
     this.playing  = true;
     this._lastTime = performance.now();
     this._raf = requestAnimationFrame(this._loop.bind(this));
@@ -188,6 +192,22 @@ class ReplayEngine {
   setSpeed(v)  { this.speed = v; }
   setTrails(v) { this.showTrails = v; if (!v) this._trails = {}; this._draw(); }
   setLabels(v) { this.showLabels = v; this._draw(); }
+  getFrameTick(frameIndex = this.currentFrame) {
+    const frame = this.frames[Math.max(0, Math.min(this.frames.length - 1, frameIndex))];
+    return frame?.tick ?? 0;
+  }
+  clearPlaybackWindow() { this.playbackWindow = null; }
+  setPlaybackWindow(startFrame, endFrame) {
+    const maxIdx = Math.max(0, this.frames.length - 1);
+    const start = Math.max(0, Math.min(maxIdx, Number(startFrame) || 0));
+    const end = Math.max(start, Math.min(maxIdx, Number(endFrame) || start));
+    this.playbackWindow = { startFrame: start, endFrame: end };
+  }
+  playWindow(startFrame, endFrame, opts = {}) {
+    this.setPlaybackWindow(startFrame, endFrame);
+    if (opts.seekToStart !== false) this.seekTo(this.playbackWindow.startFrame);
+    this.play();
+  }
 
   stop() { this.pause(); this.seekTo(0); }
 
@@ -200,6 +220,14 @@ class ReplayEngine {
       this._lastTime = now - (elapsed % interval);
       if (this.currentFrame < this.frames.length - 1) {
         this.currentFrame++;
+        if (this.playbackWindow && this.currentFrame >= this.playbackWindow.endFrame) {
+          this.currentFrame = this.playbackWindow.endFrame;
+          this._updateEventsForFrame();
+          this._draw();
+          if (this.onFrameChange) this.onFrameChange(this.currentFrame, this.frames.length);
+          this.pause();
+          return;
+        }
         this._updateEventsForFrame();
         this._draw();
         if (this.onFrameChange) this.onFrameChange(this.currentFrame, this.frames.length);

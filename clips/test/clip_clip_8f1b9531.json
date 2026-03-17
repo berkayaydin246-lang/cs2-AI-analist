@@ -1,0 +1,47 @@
+{
+  "clip_id": "clip_clip_8f1b9531",
+  "clip_plan_id": "",
+  "source_highlight_id": "",
+  "demo_id": "test",
+  "status": "failed",
+  "output_path": "clips\\test\\clip_clip_8f1b9531.mp4",
+  "output_url": null,
+  "thumbnail_path": "clips\\test\\clip_clip_8f1b9531.jpg",
+  "thumbnail_url": null,
+  "duration_s": 0.0,
+  "frame_count": 0,
+  "render_mode": "tactical_2d_mp4",
+  "pov_mode": "auto",
+  "pov_player": null,
+  "created_at": "2026-03-11T17:01:20.269528+00:00",
+  "warnings": [
+    "render_failed"
+  ],
+  "job": {
+    "schema_version": 2,
+    "demo_id": "test",
+    "clip_plan_id": "",
+    "source_highlight_id": "",
+    "round_number": 1,
+    "start_tick": 0,
+    "anchor_tick": 0,
+    "end_tick": 0,
+    "render_mode": "tactical_2d_mp4",
+    "pov_mode": "auto",
+    "pov_player": null,
+    "target_settings": {
+      "width": 1280,
+      "height": 720,
+      "fps": 20,
+      "codec": "mp4v",
+      "container": "mp4"
+    },
+    "camera_mode": null,
+    "observer_mode": null,
+    "hud_mode": null,
+    "capture_profile": null,
+    "target_player_steamid64": null
+  },
+  "metadata_path": "clips\\test\\clip_clip_8f1b9531.json",
+  "error": "No round replay data available for round 1"
+}

@@ -7,80 +7,270 @@ awpy 2.x API'sine gÃ¶re yazÄ±lmÄ±ÅŸtÄ±r.
 from awpy import Demo
 import pandas as pd
 import json
+from datetime import datetime, timezone
 from pathlib import Path
+
+from src.highlights import detect_highlights
+from src.clip_planner import build_clip_plans
+
+
+SCHEMA_VERSION = 12
+PARSER_VERSION = "1.2.0"
+
+
 
 
 def parse_demo(demo_path: str) -> dict:
     """
-    .dem dosyasÄ±nÄ± parse eder ve analiz iÃ§in gerekli veriyi Ã§Ä±karÄ±r.
+    .dem dosyasini parse eder ve analiz icin gerekli veriyi cikarir.
     """
-    print(f"[+] Demo yÃ¼kleniyor: {demo_path}")
-
-    demo = Demo(demo_path)
-    demo.parse()
-
-    # awpy 2.x header
-    map_name = "unknown"
-    if hasattr(demo, "header") and demo.header:
-        map_name = demo.header.get("map_name", "unknown")
-
-    def _to_df(val):
-        if val is None:
-            return pd.DataFrame()
-        if isinstance(val, pd.DataFrame):
-            return val
-        # awpy 2.x Polars DataFrame donusumu
-        try:
-            import polars as pl
-            if isinstance(val, pl.DataFrame):
-                return val.to_pandas()
-        except Exception:
-            pass
-        try:
-            return pd.DataFrame(val)
-        except Exception:
-            return pd.DataFrame()
-
-    kills_df    = _to_df(demo.kills    if hasattr(demo, "kills")    else None)
-    damages_df  = _to_df(demo.damages  if hasattr(demo, "damages")  else None)
-    rounds_df   = _to_df(demo.rounds   if hasattr(demo, "rounds")   else None)
-    grenades_df = _to_df(demo.grenades if hasattr(demo, "grenades") else None)
-    shots_df    = _to_df(demo.shots    if hasattr(demo, "shots")    else None)
-    ticks_df    = _to_df(demo.ticks    if hasattr(demo, "ticks")    else None)
-    bomb_df     = _to_df(
-        demo.bomb if hasattr(demo, "bomb") else (
-            demo.bomb_events if hasattr(demo, "bomb_events") else None
-        )
-    )
-
-    total_rounds = len(rounds_df) if len(rounds_df) > 0 else 0
+    ingestion = _ingest_demo(demo_path)
+    frames = ingestion["frames"]
+    map_name = ingestion["map_name"]
+    total_rounds = ingestion["total_rounds"]
 
     print(f"[+] Harita      : {map_name}")
-    print(f"[+] Round sayÄ±sÄ±: {total_rounds}")
-    print(f"[+] Kill sayÄ±sÄ± : {len(kills_df)}")
+    print(f"[+] Round sayisi: {total_rounds}")
+    print(f"[+] Kill sayisi : {len(frames['kills'])}")
 
-    player_positions = _process_ticks(ticks_df)
-    # Process kills first so we can use attacker/victim steamid columns for identity mapping
-    kills_processed = _process_kills(kills_df)
+    rounds = _normalize_round_records(_process_rounds(frames["rounds"]))
+    round_lookup = _build_round_lookup(rounds)
+
+    player_positions = _normalize_player_positions(_process_ticks(frames["ticks"]), round_lookup)
+    kills_processed = _normalize_kill_records(_process_kills(frames["kills"]), round_lookup)
+    damages_processed = _normalize_damage_records(_process_damages(frames["damages"]), round_lookup)
+    grenades_processed = _normalize_grenade_records(_process_grenades(frames["grenades"]), round_lookup)
+    bomb_events_processed = _normalize_bomb_event_records(_process_bomb_events(frames["bomb"]), round_lookup)
+    shots_processed = _normalize_shot_records(_process_shots(frames["shots"]), round_lookup)
     player_identities = _build_player_identities(player_positions, kills=kills_processed)
+    player_entities = _build_player_entities(player_positions, kills_processed, player_identities)
+    generated_at = datetime.now(timezone.utc).isoformat()
+    validation = _build_validation_summary(
+        rounds=rounds,
+        kills=kills_processed,
+        damages=damages_processed,
+        grenades=grenades_processed,
+        bomb_events=bomb_events_processed,
+        shots=shots_processed,
+        player_positions=player_positions,
+        players=player_entities,
+        player_identities=player_identities,
+    )
 
     result = {
-        "schema_version": 10,
-        "map":          map_name,
+        "schema_version": SCHEMA_VERSION,
+        "parser_version": PARSER_VERSION,
+        "generated_at": generated_at,
+        "map": map_name,
         "total_rounds": total_rounds,
-        "map_bounds":   _extract_map_bounds(ticks_df),
-        "kills":        kills_processed,
-        "damages":      _process_damages(damages_df),
-        "grenades":     _process_grenades(grenades_df),
-        "bomb_events":  _process_bomb_events(bomb_df),
-        "shots":        _process_shots(shots_df),
+        "map_bounds": _extract_map_bounds(frames["ticks"]),
+        "kills": kills_processed,
+        "damages": damages_processed,
+        "grenades": grenades_processed,
+        "bomb_events": bomb_events_processed,
+        "shots": shots_processed,
         "player_positions": player_positions,
         "player_identities": player_identities,
-        "rounds":       _process_rounds(rounds_df),
-        "players":      _get_player_list(kills_df),
+        "rounds": rounds,
+        "players": [player["player_name"] for player in player_entities],
+        "demo": {
+            "path": ingestion["demo_path"],
+            "filename": Path(ingestion["demo_path"]).name,
+            "metadata": {
+                "map_name": map_name,
+                "tick_rate": ingestion["tick_rate"],
+                "total_rounds": total_rounds,
+                "schema_version": SCHEMA_VERSION,
+                "parser_version": PARSER_VERSION,
+                "generated_at": generated_at,
+                "header": ingestion["header"],
+            },
+        },
+        "entities": {
+            "players": player_entities,
+            "player_identities": player_identities,
+        },
+        "events": {
+            "kills": kills_processed,
+            "damages": damages_processed,
+            "grenades": grenades_processed,
+            "bomb_events": bomb_events_processed,
+            "shots": shots_processed,
+            "player_positions": player_positions,
+        },
+        "validation": validation,
     }
 
+    highlight_bundle = detect_highlights(result)
+    result["highlights"] = highlight_bundle.get("highlights", [])
+    result["highlight_summary"] = {
+        "schema_version": highlight_bundle.get("schema_version"),
+        "generated_at": highlight_bundle.get("generated_at"),
+        "total_highlights": highlight_bundle.get("total_highlights", 0),
+        "counts_by_type": highlight_bundle.get("counts_by_type", {}),
+        "counts_by_round": highlight_bundle.get("counts_by_round", {}),
+        "warnings": highlight_bundle.get("warnings", []),
+    }
+
+    clip_plan_bundle = build_clip_plans(result)
+    result["clip_plans"] = clip_plan_bundle.get("clip_plans", [])
+    result["clip_plan_summary"] = {
+        "schema_version": clip_plan_bundle.get("schema_version"),
+        "generated_at": clip_plan_bundle.get("generated_at"),
+        "total_clip_plans": clip_plan_bundle.get("total_clip_plans", 0),
+        "counts_by_highlight_type": clip_plan_bundle.get("counts_by_highlight_type", {}),
+        "counts_by_pov_mode": clip_plan_bundle.get("counts_by_pov_mode", {}),
+        "warnings": clip_plan_bundle.get("warnings", []),
+    }
+
+    _log_parse_summary(result)
     return result
+
+
+
+def _ingest_demo(demo_path: str) -> dict:
+    normalized_path = str(Path(demo_path).expanduser().resolve())
+    path = Path(normalized_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Demo file not found: {normalized_path}")
+    if path.suffix.lower() != ".dem":
+        raise ValueError(f"Expected a .dem file, got: {path.name}")
+
+    print(f"[+] Demo yukleniyor: {normalized_path}")
+    demo = Demo(normalized_path)
+    demo.parse()
+
+    header = {}
+    if hasattr(demo, "header") and demo.header:
+        if isinstance(demo.header, dict):
+            header = dict(demo.header)
+        else:
+            try:
+                header = dict(demo.header)
+            except Exception:
+                header = {}
+
+    map_name = str(header.get("map_name") or "unknown")
+    tick_rate = _extract_tick_rate(header)
+    frames = {
+        "kills": _to_df(demo.kills if hasattr(demo, "kills") else None),
+        "damages": _to_df(demo.damages if hasattr(demo, "damages") else None),
+        "rounds": _to_df(demo.rounds if hasattr(demo, "rounds") else None),
+        "grenades": _to_df(demo.grenades if hasattr(demo, "grenades") else None),
+        "shots": _to_df(demo.shots if hasattr(demo, "shots") else None),
+        "ticks": _to_df(demo.ticks if hasattr(demo, "ticks") else None),
+        "bomb": _to_df(
+            demo.bomb if hasattr(demo, "bomb") else (
+                demo.bomb_events if hasattr(demo, "bomb_events") else None
+            )
+        ),
+    }
+    total_rounds = len(frames["rounds"]) if not frames["rounds"].empty else 0
+    return {
+        "demo_path": normalized_path,
+        "header": header,
+        "map_name": map_name,
+        "tick_rate": tick_rate,
+        "total_rounds": total_rounds,
+        "frames": frames,
+    }
+
+
+def _to_df(val):
+    if val is None:
+        return pd.DataFrame()
+    if isinstance(val, pd.DataFrame):
+        return val
+    try:
+        import polars as pl
+        if isinstance(val, pl.DataFrame):
+            return val.to_pandas()
+    except Exception:
+        pass
+    try:
+        return pd.DataFrame(val)
+    except Exception:
+        return pd.DataFrame()
+
+
+def _extract_tick_rate(header: dict) -> int | None:
+    for key in ("tick_rate", "tickrate", "tick_interval", "tick_interval_ms"):
+        value = header.get(key)
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            continue
+        if numeric <= 0:
+            continue
+        if "interval" in key:
+            return int(round(1000.0 / numeric)) if numeric >= 1 else int(round(1.0 / numeric))
+        return int(round(numeric))
+    return None
+
+
+def _safe_int(value, default: int | None = None) -> int | None:
+    if value is None or value == "":
+        return default
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(value, default: float | None = None) -> float | None:
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _clean_text(value) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _normalize_side(value) -> str:
+    side = _clean_text(value).upper()
+    if side in {"CT", "COUNTERTERRORIST", "COUNTER-TERRORIST", "COUNTER_TERRORIST"}:
+        return "CT"
+    if side in {"T", "TERRORIST", "TERRORISTS"}:
+        return "T"
+    return side
+
+
+def _coerce_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    return _clean_text(value).lower() in {"1", "true", "yes", "y"}
+
+
+def _build_round_lookup(rounds: list[dict]) -> list[dict]:
+    lookup = []
+    for round_info in rounds:
+        round_num = _safe_int(round_info.get("round_num"), None)
+        start_tick = _safe_int(round_info.get("start_tick"), None)
+        end_tick = _safe_int(round_info.get("end_tick"), None)
+        if round_num is None or start_tick is None or end_tick is None or end_tick < start_tick:
+            continue
+        lookup.append({"round_num": round_num, "start_tick": start_tick, "end_tick": end_tick})
+    lookup.sort(key=lambda item: item["start_tick"])
+    return lookup
+
+
+def _assign_round_num(record: dict, round_lookup: list[dict]) -> int | None:
+    existing = _safe_int(record.get("round_num"), None)
+    if existing is not None and existing > 0:
+        return existing
+    tick = _safe_int(record.get("tick"), None)
+    if tick is None:
+        return None
+    for round_info in round_lookup:
+        if round_info["start_tick"] <= tick <= round_info["end_tick"]:
+            return round_info["round_num"]
+    return None
 
 
 def _col(df: pd.DataFrame, *candidates):
@@ -313,6 +503,8 @@ def _process_ticks(df: pd.DataFrame, sample_step: int = 8) -> list:
                 rename_map[col] = "x"
             elif cl in ("y", "player_y"):
                 rename_map[col] = "y"
+            elif cl in ("z", "player_z"):
+                rename_map[col] = "z"
             elif cl in ("side",):
                 rename_map[col] = "side"
             elif cl in ("round", "round_num"):
@@ -348,6 +540,8 @@ def _process_ticks(df: pd.DataFrame, sample_step: int = 8) -> list:
     sampled = pd.concat(sampled_parts, ignore_index=True) if sampled_parts else df.iloc[0:0].copy()
     sampled["x"] = pd.to_numeric(sampled["x"], errors="coerce")
     sampled["y"] = pd.to_numeric(sampled["y"], errors="coerce")
+    if "z" in sampled.columns:
+        sampled["z"] = pd.to_numeric(sampled["z"], errors="coerce")
     sampled = sampled.dropna(subset=["x", "y", "player_name"])
 
     if "round_num" in sampled.columns:
@@ -373,7 +567,7 @@ def _process_ticks(df: pd.DataFrame, sample_step: int = 8) -> list:
                 lambda s: s.interpolate(limit_direction="both")
             )
 
-    keep = [c for c in ["player_name", "steamid", "x", "y", "side", "round_num", "tick", "yaw", "hp", "armor"] if c in sampled.columns]
+    keep = [c for c in ["player_name", "steamid", "x", "y", "z", "side", "round_num", "tick", "yaw", "hp", "armor"] if c in sampled.columns]
     rows = sampled[keep].to_dict(orient="records")
     print(f"[+] Player positions (sampled): {len(rows)}")
     return rows
@@ -403,6 +597,8 @@ def _process_bomb_events(df: pd.DataFrame) -> list:
             rename_map[col] = "x"
         elif cl in ("y", "bomb_y", "player_y", "site_y"):
             rename_map[col] = "y"
+        elif cl in ("z", "bomb_z", "player_z", "site_z"):
+            rename_map[col] = "z"
     if rename_map:
         df = df.rename(columns=rename_map)
 
@@ -436,8 +632,10 @@ def _process_bomb_events(df: pd.DataFrame) -> list:
         df["x"] = pd.to_numeric(df["x"], errors="coerce")
     if "y" in df.columns:
         df["y"] = pd.to_numeric(df["y"], errors="coerce")
+    if "z" in df.columns:
+        df["z"] = pd.to_numeric(df["z"], errors="coerce")
 
-    keep = [c for c in ["event", "tick", "round_num", "player_name", "x", "y"] if c in df.columns]
+    keep = [c for c in ["event", "tick", "round_num", "player_name", "x", "y", "z"] if c in df.columns]
     if not keep:
         return []
     out = df[keep].copy()
@@ -651,6 +849,27 @@ def _process_rounds(df: pd.DataFrame) -> list:
     if df is None or df.empty:
         return []
 
+    if isinstance(df.columns[0], str):
+        rename_map = {}
+        for col in df.columns:
+            cl = str(col).lower()
+            if cl in ("round", "round_number"):
+                rename_map[col] = "round_num"
+            elif cl in ("start_tick", "round_start", "starttick"):
+                rename_map[col] = "start"
+            elif cl in ("freeze_end_tick", "freezeend", "freezetime_end"):
+                rename_map[col] = "freeze_end"
+            elif cl in ("end_tick", "round_end"):
+                rename_map[col] = "end"
+            elif cl in ("official_end_tick", "officialend"):
+                rename_map[col] = "official_end"
+            elif cl in ("winning_side",):
+                rename_map[col] = "winner_side"
+            elif cl in ("endreason",):
+                rename_map[col] = "endReason"
+        if rename_map:
+            df = df.rename(columns=rename_map)
+
     keep = [c for c in [
                          "round_num",
                          "start",
@@ -772,14 +991,7 @@ def _build_player_identities(player_positions: list, kills: list | None = None) 
     if not pair_counts:
         return {"by_steamid": {}, "by_name": {}}
 
-    # Primary index: steamid64 → most-common name for that steamid64
-    by_steamid: dict[str, dict] = {}
-    for (name, sid), cnt in pair_counts.items():
-        prev = by_steamid.get(sid)
-        if prev is None or cnt > prev["appearances"]:
-            by_steamid[sid] = {"player_name": name, "appearances": cnt}
-
-    # Reverse index: player_name → steamid64 (highest-vote steamid64 per name)
+    # Reverse index: player_name -> steamid64 (highest-vote steamid64 per name)
     name_best: dict[str, tuple[str, int]] = {}
     for (name, sid), cnt in pair_counts.items():
         prev = name_best.get(name)
@@ -787,13 +999,292 @@ def _build_player_identities(player_positions: list, kills: list | None = None) 
             name_best[name] = (sid, cnt)
     by_name: dict[str, str] = {name: sid for name, (sid, _) in name_best.items()}
 
-    # Diagnostic log: show every resolved identity so wrong-mapping is easy to spot
+    # Canonical primary index: keep only the winning steamid per player name.
+    by_steamid: dict[str, dict] = {}
+    for name, (sid, cnt) in name_best.items():
+        prev = by_steamid.get(sid)
+        if prev is None or cnt > prev["appearances"]:
+            by_steamid[sid] = {"player_name": name, "appearances": cnt}
+
     kills_contributed = any(k.get("attacker_steamid") or k.get("victim_steamid") for k in (kills or []))
     print(f"[+] Player identities: {len(by_steamid)} SteamID64s  (kills_source={kills_contributed})")
-    for sid, info in sorted(by_steamid.items(), key=lambda kv: -kv[1]["appearances"]):
-        print(f"    SteamID64={sid}  name={info['player_name']!r}  score={info['appearances']}")
 
     return {"by_steamid": by_steamid, "by_name": by_name}
+
+
+
+def _normalize_kill_records(records: list[dict], round_lookup: list[dict]) -> list[dict]:
+    normalized = []
+    for record in records or []:
+        normalized.append({
+            "tick": _safe_int(record.get("tick"), None),
+            "round_num": _assign_round_num(record, round_lookup),
+            "attacker_name": _clean_text(record.get("attacker_name")),
+            "victim_name": _clean_text(record.get("victim_name")),
+            "assister_name": _clean_text(record.get("assister_name")),
+            "weapon": _clean_text(record.get("weapon")),
+            "headshot": _coerce_bool(record.get("headshot")),
+            "attacker_side": _normalize_side(record.get("attacker_side")),
+            "victim_side": _normalize_side(record.get("victim_side")),
+            "victim_x": _safe_float(record.get("victim_x"), None),
+            "victim_y": _safe_float(record.get("victim_y"), None),
+            "attacker_steamid": _normalize_steamid64(record.get("attacker_steamid")),
+            "victim_steamid": _normalize_steamid64(record.get("victim_steamid")),
+            "assister_steamid": _normalize_steamid64(record.get("assister_steamid")),
+        })
+    return normalized
+
+
+def _normalize_damage_records(records: list[dict], round_lookup: list[dict]) -> list[dict]:
+    normalized = []
+    for record in records or []:
+        normalized.append({
+            "tick": _safe_int(record.get("tick"), None),
+            "round_num": _assign_round_num(record, round_lookup),
+            "attacker_name": _clean_text(record.get("attacker_name")),
+            "victim_name": _clean_text(record.get("victim_name")),
+            "hp_damage": _safe_int(record.get("hp_damage"), 0) or 0,
+            "weapon": _clean_text(record.get("weapon")),
+            "hitgroup": _clean_text(record.get("hitgroup")),
+            "victim_x": _safe_float(record.get("victim_x"), None),
+            "victim_y": _safe_float(record.get("victim_y"), None),
+            "attacker_x": _safe_float(record.get("attacker_x"), None),
+            "attacker_y": _safe_float(record.get("attacker_y"), None),
+        })
+    return normalized
+
+
+def _normalize_grenade_records(records: list[dict], round_lookup: list[dict]) -> list[dict]:
+    normalized = []
+    for record in records or []:
+        item = {
+            "tick": _safe_int(record.get("tick"), None),
+            "round_num": _assign_round_num(record, round_lookup),
+            "thrower_name": _clean_text(record.get("thrower_name")),
+            "player_name": _clean_text(record.get("thrower_name")),
+            "grenade_type": _clean_text(record.get("grenade_type")),
+            "event_type": "throw",
+            "nade_x": _safe_float(record.get("nade_x"), None),
+            "nade_y": _safe_float(record.get("nade_y"), None),
+            "nade_start_x": _safe_float(record.get("nade_start_x"), None),
+            "nade_start_y": _safe_float(record.get("nade_start_y"), None),
+            "nade_end_x": _safe_float(record.get("nade_end_x"), None),
+            "nade_end_y": _safe_float(record.get("nade_end_y"), None),
+            "nade_path": record.get("nade_path") if isinstance(record.get("nade_path"), list) else [],
+        }
+        if "nade_start_z" in record:
+            item["nade_start_z"] = _safe_float(record.get("nade_start_z"), None)
+        if "nade_end_z" in record:
+            item["nade_end_z"] = _safe_float(record.get("nade_end_z"), None)
+        normalized.append(item)
+    return normalized
+
+
+def _normalize_bomb_event_records(records: list[dict], round_lookup: list[dict]) -> list[dict]:
+    normalized = []
+    for record in records or []:
+        event_type = _clean_text(record.get("event"))
+        normalized.append({
+            "tick": _safe_int(record.get("tick"), None),
+            "round_num": _assign_round_num(record, round_lookup),
+            "event": event_type,
+            "event_type": event_type,
+            "player_name": _clean_text(record.get("player_name")),
+            "x": _safe_float(record.get("x"), None),
+            "y": _safe_float(record.get("y"), None),
+            "z": _safe_float(record.get("z"), None),
+        })
+    return normalized
+
+
+def _normalize_shot_records(records: list[dict], round_lookup: list[dict]) -> list[dict]:
+    normalized = []
+    for record in records or []:
+        normalized.append({
+            "tick": _safe_int(record.get("tick"), None),
+            "round_num": _assign_round_num(record, round_lookup),
+            "shooter_name": _clean_text(record.get("shooter_name")),
+            "shooter_side": _normalize_side(record.get("shooter_side")),
+            "weapon": _clean_text(record.get("weapon")),
+            "shot_x": _safe_float(record.get("shot_x"), None),
+            "shot_y": _safe_float(record.get("shot_y"), None),
+        })
+    return normalized
+
+
+def _normalize_player_positions(records: list[dict], round_lookup: list[dict]) -> list[dict]:
+    normalized = []
+    for record in records or []:
+        hp = _safe_int(record.get("hp"), None)
+        normalized.append({
+            "tick": _safe_int(record.get("tick"), None),
+            "round_num": _assign_round_num(record, round_lookup),
+            "player_name": _clean_text(record.get("player_name")),
+            "steamid": _normalize_steamid64(record.get("steamid")),
+            "x": _safe_float(record.get("x"), None),
+            "y": _safe_float(record.get("y"), None),
+            "z": _safe_float(record.get("z"), None),
+            "side": _normalize_side(record.get("side")),
+            "yaw": _safe_float(record.get("yaw"), None),
+            "hp": hp,
+            "armor": _safe_int(record.get("armor"), None),
+            "alive": None if hp is None else hp > 0,
+        })
+    return normalized
+
+
+def _normalize_round_records(records: list[dict]) -> list[dict]:
+    normalized = []
+    for idx, record in enumerate(records or [], start=1):
+        round_num = _safe_int(record.get("round_num"), idx) or idx
+        start_tick = _safe_int(record.get("start"), None)
+        freeze_end_tick = _safe_int(record.get("freeze_end"), None)
+        official_end = _safe_int(record.get("official_end"), None)
+        end_tick = official_end if official_end is not None else _safe_int(record.get("end"), None)
+        reason = _clean_text(record.get("reason") or record.get("endReason"))
+        winner_side = _normalize_side(record.get("winner_side") or record.get("winner") or record.get("winnerSide"))
+        normalized.append({
+            "round_num": round_num,
+            "start": start_tick,
+            "freeze_end": freeze_end_tick,
+            "end": _safe_int(record.get("end"), None),
+            "official_end": official_end,
+            "winner": _clean_text(record.get("winner")),
+            "bomb_plant": _clean_text(record.get("bomb_plant")),
+            "bomb_site": _clean_text(record.get("bomb_site")),
+            "winner_side": winner_side,
+            "reason": reason,
+            "ct_eq_val": _safe_int(record.get("ct_eq_val"), None),
+            "t_eq_val": _safe_int(record.get("t_eq_val"), None),
+            "start_tick": start_tick,
+            "freeze_end_tick": freeze_end_tick,
+            "end_tick": end_tick,
+            "end_reason": reason,
+        })
+    return normalized
+
+
+def _build_player_entities(player_positions: list[dict], kills: list[dict], player_identities: dict) -> list[dict]:
+    players: dict[str, dict] = {}
+
+    def ensure(name: str) -> dict | None:
+        player_name = _clean_text(name)
+        if not player_name:
+            return None
+        if player_name not in players:
+            players[player_name] = {
+                "player_name": player_name,
+                "steamid64": None,
+                "side": "",
+                "sides": set(),
+                "identity": {"display_name": player_name},
+                "position_samples": 0,
+                "kill_events": 0,
+                "death_events": 0,
+                "assist_events": 0,
+            }
+        return players[player_name]
+
+    for row in player_positions or []:
+        player = ensure(row.get("player_name"))
+        if not player:
+            continue
+        sid = _normalize_steamid64(row.get("steamid"))
+        if sid and not player["steamid64"]:
+            player["steamid64"] = sid
+        side = _normalize_side(row.get("side"))
+        if side:
+            player["sides"].add(side)
+        player["position_samples"] += 1
+
+    for kill in kills or []:
+        for role, name_key, sid_key, side_key in (
+            ("kill_events", "attacker_name", "attacker_steamid", "attacker_side"),
+            ("death_events", "victim_name", "victim_steamid", "victim_side"),
+            ("assist_events", "assister_name", "assister_steamid", None),
+        ):
+            player = ensure(kill.get(name_key))
+            if not player:
+                continue
+            player[role] += 1
+            sid = _normalize_steamid64(kill.get(sid_key))
+            if sid and not player["steamid64"]:
+                player["steamid64"] = sid
+            if side_key:
+                side = _normalize_side(kill.get(side_key))
+                if side:
+                    player["sides"].add(side)
+
+    by_name = (player_identities or {}).get("by_name", {})
+    for player in players.values():
+        if not player["steamid64"]:
+            player["steamid64"] = _normalize_steamid64(by_name.get(player["player_name"]))
+        known_sides = sorted(player["sides"])
+        player["side"] = known_sides[0] if known_sides else ""
+        player["identity"] = {
+            "display_name": player["player_name"],
+            "steamid64": player["steamid64"],
+            "known_sides": known_sides,
+        }
+        player.pop("sides", None)
+
+    return sorted(players.values(), key=lambda item: item["player_name"].lower())
+
+
+def _build_validation_summary(rounds: list[dict], kills: list[dict], damages: list[dict], grenades: list[dict], bomb_events: list[dict], shots: list[dict], player_positions: list[dict], players: list[dict], player_identities: dict) -> dict:
+    missing_round_assignments = {
+        "kills": sum(1 for row in kills if row.get("round_num") is None),
+        "damages": sum(1 for row in damages if row.get("round_num") is None),
+        "grenades": sum(1 for row in grenades if row.get("round_num") is None),
+        "bomb_events": sum(1 for row in bomb_events if row.get("round_num") is None),
+        "shots": sum(1 for row in shots if row.get("round_num") is None),
+        "player_positions": sum(1 for row in player_positions if row.get("round_num") is None),
+    }
+    warnings = []
+    if not rounds:
+        warnings.append("rounds_missing")
+    if not players:
+        warnings.append("players_missing")
+    if missing_round_assignments["kills"]:
+        warnings.append("kills_without_round")
+    if missing_round_assignments["player_positions"]:
+        warnings.append("positions_without_round")
+    return {
+        "is_valid": len(warnings) == 0,
+        "warnings": warnings,
+        "counts": {
+            "players": len(players),
+            "rounds": len(rounds),
+            "kills": len(kills),
+            "damages": len(damages),
+            "grenades": len(grenades),
+            "bomb_events": len(bomb_events),
+            "shots": len(shots),
+            "player_positions": len(player_positions),
+            "resolved_steamids": len((player_identities or {}).get("by_steamid", {})),
+            "missing_steamids": sum(1 for player in players if not player.get("steamid64")),
+        },
+        "missing_round_assignments": missing_round_assignments,
+    }
+
+
+def _log_parse_summary(parsed: dict) -> None:
+    counts = (parsed.get("validation") or {}).get("counts", {})
+    highlight_total = ((parsed.get("highlight_summary") or {}).get("total_highlights", 0))
+    clip_plan_total = ((parsed.get("clip_plan_summary") or {}).get("total_clip_plans", 0))
+    print(
+        "[+] Parse summary:"
+        f" players={counts.get('players', 0)}"
+        f" rounds={counts.get('rounds', 0)}"
+        f" kills={counts.get('kills', 0)}"
+        f" damages={counts.get('damages', 0)}"
+        f" grenades={counts.get('grenades', 0)}"
+        f" bomb_events={counts.get('bomb_events', 0)}"
+        f" positions={counts.get('player_positions', 0)}"
+        f" missing_steamids={counts.get('missing_steamids', 0)}"
+        f" highlights={highlight_total}"
+        f" clip_plans={clip_plan_total}"
+    )
 
 
 def save_parsed_data(data: dict, output_path: str):
