@@ -16,12 +16,12 @@ for demo playback. Recording (OBS / game capture) will be layered on top.
 from __future__ import annotations
 
 import ctypes
-import ctypes.wintypes
 import hashlib
 import logging
 import re
 import socket
 import subprocess
+import sys
 import time
 import os
 import shutil
@@ -35,19 +35,26 @@ from src.cs2_config import build_cs2_config, get_cs2_launch_args, validate_cs2_c
 logger = logging.getLogger(__name__)
 
 # ── Win32 keyboard input helpers (fallback when netcon TCP is unavailable) ────
+# These are only available on Windows; on other platforms they are set to None
+# so that the module can be imported for testing and non-Windows usage.
 
-_user32 = ctypes.windll.user32
-_kernel32 = ctypes.windll.kernel32
+_user32 = None
+_kernel32 = None
 
-# Configure ctypes return/arg types for 64-bit compatibility
-_kernel32.GlobalAlloc.restype = ctypes.c_void_p
-_kernel32.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
-_kernel32.GlobalLock.restype = ctypes.c_void_p
-_kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
-_kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
-_kernel32.GlobalFree.argtypes = [ctypes.c_void_p]
-_user32.SetClipboardData.restype = ctypes.c_void_p
-_user32.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
+if sys.platform == "win32":
+    import ctypes.wintypes
+    _user32 = ctypes.windll.user32
+    _kernel32 = ctypes.windll.kernel32
+
+    # Configure ctypes return/arg types for 64-bit compatibility
+    _kernel32.GlobalAlloc.restype = ctypes.c_void_p
+    _kernel32.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
+    _kernel32.GlobalLock.restype = ctypes.c_void_p
+    _kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+    _kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+    _kernel32.GlobalFree.argtypes = [ctypes.c_void_p]
+    _user32.SetClipboardData.restype = ctypes.c_void_p
+    _user32.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
 
 # Virtual key codes
 _VK_RETURN = 0x0D
