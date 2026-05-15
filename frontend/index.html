@@ -42,6 +42,9 @@
       <a class="nav-item" data-view="replay" href="#">
         <span class="nav-icon">R</span><span class="nav-label">2D Replay</span>
       </a>
+      <a class="nav-item" data-view="clips" href="#">
+        <span class="nav-icon">C</span><span class="nav-label">Clips</span>
+      </a>
       <a class="nav-item" data-view="coaching" href="#">
         <span class="nav-icon">AI</span><span class="nav-label">AI Coach</span>
       </a>
@@ -188,6 +191,34 @@
           </div>
         </div>
       </div>
+    </div>
+
+    <!-- ── COACHING VIEW ─────────────────────────────────────────────────── -->
+    <div class="view" id="view-clips">
+      <div class="view-header">
+        <h1>Clips</h1>
+        <p class="view-subtitle">Best moments, clip plans, render queue, and completed clips</p>
+      </div>
+
+      <div class="clips-toolbar">
+        <div class="clips-toolbar-left">
+          <select id="clips-player-select" class="select"></select>
+          <select id="clips-max-select" class="select">
+            <option value="5">Top 5</option>
+            <option value="10" selected>Top 10</option>
+            <option value="15">Top 15</option>
+          </select>
+        </div>
+        <div class="clips-toolbar-actions">
+          <button class="btn btn-secondary" id="btn-load-highlights">Load Highlights</button>
+          <button class="btn btn-secondary" id="btn-create-clip-plans">Create Clip Plans</button>
+          <button class="btn btn-primary" id="btn-enqueue-renders">Queue Render Jobs</button>
+          <button class="btn btn-secondary" id="btn-refresh-clips">Refresh</button>
+        </div>
+      </div>
+
+      <div id="clips-status" class="status-text clips-status"></div>
+      <div id="clips-body"></div>
     </div>
 
     <!-- ── COACHING VIEW ─────────────────────────────────────────────────── -->

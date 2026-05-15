@@ -35,8 +35,14 @@ sys.path.insert(0, str(BASE_DIR))
 load_dotenv(dotenv_path=BASE_DIR / ".env")
 
 from src.analyzer import analyze_player          # noqa: E402
+from src.clip_planner import plan_clips          # noqa: E402
 from src.coach import get_coaching, get_scouting_report  # noqa: E402
+from src.highlights import extract_highlights    # noqa: E402
+from src.hlae_worker_runtime import HLAEWorkerRuntime  # noqa: E402
 from src.parser import parse_demo                # noqa: E402
+from src.render_recipe import RenderRecipe, RenderRecipeError  # noqa: E402
+from src.render_queue import RenderQueue, RenderJob  # noqa: E402
+from src.cs2_config import load_config  # noqa: E402
 from src.team_analyzer import analyze_team       # noqa: E402
 from src.utils import (                          # noqa: E402
     create_round_route_gif,
@@ -957,4 +963,247 @@ def scouting(demo_id: str, target_team: str):
         return {"report": report, "team": target_team}
     except Exception as exc:
         raise HTTPException(500, detail=str(exc))
+
+
+# ── Render queue (singleton) ─────────────────────────────────────────────────
+
+_render_queue = RenderQueue(queue_dir=str(GENERATED_DIR / "queue_v2"))
+_runtime_config = load_config()
+
+
+@app.on_event("startup")
+def _startup_reset_render_queue():
+    """Start clean on each backend boot.
+
+    The user wants stale queue state gone whenever the backend restarts so
+    failed/claimed jobs from previous runs do not poison new render tests.
+    """
+    removed = _render_queue.clear_all_jobs()
+    if removed:
+        print(f"[startup] cleared {removed} render jobs from {_render_queue.queue_dir}")
+
+
+# ── Highlights / Best moments ────────────────────────────────────────────────
+
+@app.get("/api/demo/{demo_id}/highlights")
+def get_highlights(demo_id: str, player: str = "", max_results: int = 20):
+    """Extract best moments from parsed demo data."""
+    _, parsed = _parsed(demo_id)
+    try:
+        highlights = extract_highlights(
+            parsed,
+            player_filter=player or None,
+            max_highlights=min(max_results, 50),
+        )
+        return {"demo_id": demo_id, "player_filter": player or None, "highlights": highlights}
+    except Exception as exc:
+        raise HTTPException(500, detail=str(exc))
+
+
+# ── Clip planning ────────────────────────────────────────────────────────────
+
+@app.post("/api/demo/{demo_id}/clip-plans")
+def create_clip_plans(demo_id: str, player: str = "", max_clips: int = 10):
+    """Generate clip plans from highlights."""
+    s, parsed = _parsed(demo_id)
+    try:
+        highlights = extract_highlights(
+            parsed,
+            player_filter=player or None,
+            max_highlights=min(max_clips, 30),
+        )
+        plans = plan_clips(highlights, demo_id, max_clips=min(max_clips, 30))
+        # Cache in session
+        s.setdefault("clip_plans", {})[player or "__all__"] = plans
+        return {
+            "demo_id": demo_id,
+            "player_filter": player or None,
+            "clip_plans": plans,
+            "count": len(plans),
+        }
+    except Exception as exc:
+        raise HTTPException(500, detail=str(exc))
+
+
+# ── Render job management ────────────────────────────────────────────────────
+
+@app.post("/api/demo/{demo_id}/render/enqueue")
+def enqueue_render(demo_id: str, player: str = "", max_clips: int = 5):
+    """Create clip plans and enqueue render jobs."""
+    s, parsed = _parsed(demo_id)
+    demo_path = s.get("path", "")
+    if not demo_path:
+        raise HTTPException(400, detail="Demo file path not available")
+
+    try:
+        highlights = extract_highlights(
+            parsed,
+            player_filter=player or None,
+            max_highlights=min(max_clips, 20),
+        )
+        plans = plan_clips(highlights, demo_id, max_clips=min(max_clips, 20))
+
+        jobs = []
+        for plan in plans:
+            job = _render_queue.create_job(
+                clip_plan=plan,
+                demo_id=demo_id,
+                demo_path=demo_path,
+                output_base_dir=str(GENERATED_DIR / "clips" / demo_id),
+            )
+            jobs.append(job.to_dict())
+
+        return {
+            "demo_id": demo_id,
+            "player_filter": player or None,
+            "jobs_created": len(jobs),
+            "jobs": jobs,
+        }
+    except Exception as exc:
+        raise HTTPException(500, detail=str(exc))
+
+
+@app.post("/api/demo/{demo_id}/render/enqueue-plan")
+def enqueue_render_plan(demo_id: str, clip_plan: dict):
+    """Enqueue a single clip plan as a render job."""
+    s, _parsed_data = _parsed(demo_id)
+    demo_path = s.get("path", "")
+    if not demo_path:
+        raise HTTPException(400, detail="Demo file path not available")
+    if not isinstance(clip_plan, dict) or not clip_plan:
+        raise HTTPException(400, detail="clip_plan payload is required")
+
+    try:
+        job = _render_queue.create_job(
+            clip_plan=clip_plan,
+            demo_id=demo_id,
+            demo_path=demo_path,
+            output_base_dir=str(GENERATED_DIR / "clips" / demo_id),
+        )
+        return {
+            "demo_id": demo_id,
+            "job": job.to_dict(),
+        }
+    except Exception as exc:
+        raise HTTPException(500, detail=str(exc))
+
+
+@app.get("/api/demo/{demo_id}/render/status")
+def render_status(demo_id: str):
+    """Get render queue status for a demo."""
+    status = _render_queue.get_queue_status(demo_id=demo_id)
+    jobs = _render_queue.list_jobs(demo_id=demo_id)
+    return {
+        "demo_id": demo_id,
+        "queue_status": status,
+        "jobs": [j.to_dict() for j in jobs],
+    }
+
+
+@app.get("/api/render/job/{job_id}")
+def render_job_detail(job_id: str):
+    """Get detailed status of a single render job."""
+    job = _render_queue.get_job(job_id)
+    if not job:
+        raise HTTPException(404, detail=f"Job {job_id} not found")
+    return job.to_dict()
+
+
+@app.post("/api/render/recipe")
+def debug_render_recipe(payload: dict, execute: int = 0):
+    """Validate or run a direct HLAE render recipe for local debugging.
+
+    This is intentionally operator-facing and not the primary app flow.
+    """
+    try:
+        recipe = RenderRecipe(**payload)
+        recipe.validate()
+    except (TypeError, RenderRecipeError) as exc:
+        raise HTTPException(400, detail=str(exc))
+
+    if not execute:
+        return {"recipe": recipe.to_dict(), "validated": True}
+
+    runtime = HLAEWorkerRuntime(config=_runtime_config)
+    # Build a lightweight synthetic job wrapper for artifact compatibility.
+    fake_job = RenderJob(
+        job_id=recipe.job_id,
+        clip_id=recipe.metadata.get("clip_plan_id") or recipe.output_name,
+        demo_id=recipe.metadata.get("demo_id", "direct_recipe"),
+        demo_path=recipe.demo_path,
+        clip_plan={
+            "clip_plan_id": recipe.metadata.get("clip_plan_id") or recipe.output_name,
+            "highlight_id": recipe.metadata.get("highlight_id", ""),
+            "event_type": recipe.metadata.get("event_type", ""),
+            "selection_reason": recipe.metadata.get("selection_reason", ""),
+            "score": recipe.metadata.get("score", 0),
+            "priority": recipe.metadata.get("priority", 0),
+            "confidence": recipe.metadata.get("confidence", 0),
+            "player_name": recipe.player_name,
+            "player_steamid64": recipe.player_steamid64,
+            "round_number": recipe.round_number,
+            "start_tick": recipe.start_tick,
+            "anchor_tick": recipe.anchor_tick,
+            "end_tick": recipe.end_tick,
+            "round_start_tick": recipe.round_start_tick,
+            "round_end_tick": recipe.round_end_tick,
+            "freeze_end_tick": recipe.freeze_end_tick,
+            "lead_in_ticks": recipe.pre_roll_ticks,
+            "tail_ticks": recipe.post_roll_ticks,
+            "pov_mode": recipe.camera_mode,
+            "camera_mode": recipe.observer_mode,
+            "output_name": recipe.output_name,
+            "fps": recipe.fps,
+            "width": recipe.width,
+            "height": recipe.height,
+            "video_container": recipe.video_container,
+            "encode_preset": recipe.encode_preset,
+        },
+        player_name=recipe.player_name,
+        player_steamid64=recipe.player_steamid64,
+        round_number=recipe.round_number,
+        start_tick=recipe.start_tick,
+        anchor_tick=recipe.anchor_tick,
+        end_tick=recipe.end_tick,
+        round_start_tick=recipe.round_start_tick,
+        round_end_tick=recipe.round_end_tick,
+        freeze_end_tick=recipe.freeze_end_tick,
+        clip_duration_s=recipe.render_duration_seconds,
+        pov_mode=recipe.camera_mode,
+        camera_mode=recipe.observer_mode,
+        output_dir=recipe.output_dir,
+        output_name=recipe.output_name,
+        fps=recipe.fps,
+        width=recipe.width,
+        height=recipe.height,
+        video_container=recipe.video_container,
+        encode_preset=recipe.encode_preset,
+    )
+    built_recipe, render_result, artifact = runtime.render_job(fake_job)
+    return {
+        "recipe": built_recipe.to_dict(),
+        "render_result": render_result.to_dict(),
+        "artifact": artifact,
+    }
+
+
+@app.get("/api/demo/{demo_id}/clips")
+def list_clips(demo_id: str):
+    """List completed clip artifacts for a demo."""
+    clips_dir = GENERATED_DIR / "clips" / demo_id
+    if not clips_dir.exists():
+        return {"demo_id": demo_id, "clips": []}
+
+    clips = []
+    for artifact_path in clips_dir.rglob("artifact.json"):
+        try:
+            with open(artifact_path, "r", encoding="utf-8") as f:
+                artifact = json.load(f)
+            if artifact.get("status") == "completed":
+                clips.append(artifact)
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    clips.sort(key=lambda c: c.get("priority", 999))
+    return {"demo_id": demo_id, "clips": clips, "count": len(clips)}
 

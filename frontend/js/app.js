@@ -21,9 +21,14 @@ const State = {
   currentPlayer: null,
   replayRounds: [],
   radarUrl:     null,
+  clipHighlights: null,
+  clipPlans: null,
+  renderJobs: [],
+  completedClips: [],
 };
 
 let replayEngine = null;
+let clipsPollTimer = null;
 const steamDebugEnabled = (() => {
   try {
     const qp = new URLSearchParams(window.location.search || '');
@@ -266,6 +271,8 @@ function ratingClass(r) {
 function navigateTo(viewName) {
   $$('.nav-item').forEach(a => a.classList.toggle('active', a.dataset.view === viewName));
   $$('.view').forEach(v => v.classList.toggle('active', v.id === `view-${viewName}`));
+  if (viewName === 'clips') startClipsPolling();
+  else stopClipsPolling();
 }
 
 $$('.nav-item').forEach(a => {
@@ -277,6 +284,7 @@ $$('.nav-item').forEach(a => {
     if (view === 'overview') renderOverview();
     if (view === 'team')     renderTeam();
     if (view === 'replay')   initReplayView();
+    if (view === 'clips')    renderClipsView();
     if (view === 'coaching') renderCoachingView();
   });
 });
@@ -308,6 +316,7 @@ function setStep(stepId, state) {
 function setStatus(msg) { $('#upload-status-msg').textContent = msg; }
 
 function resetDemoScopedState() {
+  stopClipsPolling();
   if (replayEngine) {
     replayEngine.stop();
     replayEngine = null;
@@ -322,6 +331,10 @@ function resetDemoScopedState() {
   State.currentPlayer = null;
   State.replayRounds = [];
   State.radarUrl = null;
+  State.clipHighlights = null;
+  State.clipPlans = null;
+  State.renderJobs = [];
+  State.completedClips = [];
 
   const pills = $('#round-pills');
   if (pills) {
@@ -396,10 +409,16 @@ async function startUpload(file) {
 
 function populatePlayerSelects() {
   const players = State.players;
-  ['#player-select', '#coaching-player-select'].forEach(sel => {
+  ['#player-select', '#coaching-player-select', '#clips-player-select'].forEach(sel => {
     const elSel = $(sel);
     if (!elSel) return;
     elSel.innerHTML = '';
+    if (sel === '#clips-player-select') {
+      const all = document.createElement('option');
+      all.value = '__all__';
+      all.textContent = 'All players';
+      elSel.appendChild(all);
+    }
     players.forEach(p => {
       const o = document.createElement('option');
       o.value = p;
@@ -407,6 +426,41 @@ function populatePlayerSelects() {
       elSel.appendChild(o);
     });
   });
+}
+
+function getClipsPlayerFilter() {
+  const select = $('#clips-player-select');
+  if (!select) return '';
+  return select.value && select.value !== '__all__' ? select.value : '';
+}
+
+function getClipsMax() {
+  return Math.max(1, parseInt($('#clips-max-select')?.value || '10', 10) || 10);
+}
+
+function setClipsStatus(message, isError = false) {
+  const status = $('#clips-status');
+  if (!status) return;
+  status.textContent = message || '';
+  status.classList.toggle('text-danger', Boolean(isError && message));
+  status.classList.toggle('text-muted', !isError);
+}
+
+function stopClipsPolling() {
+  if (clipsPollTimer) {
+    clearInterval(clipsPollTimer);
+    clipsPollTimer = null;
+  }
+}
+
+function startClipsPolling() {
+  if (clipsPollTimer || !State.demoId) return;
+  clipsPollTimer = setInterval(() => {
+    if (!State.demoId || !$('#view-clips')?.classList.contains('active')) return;
+    refreshClipsStatus({ background: true }).catch((err) => {
+      console.warn('Clips polling failed:', err);
+    });
+  }, 5000);
 }
 
 // â”€â”€ Scoreboard builder â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -513,10 +567,367 @@ async function renderOverview() {
   }
 }
 
+function renderHighlightsTable(highlights) {
+  if (!highlights?.length) {
+    return `
+      <div class="empty-state">
+        <div class="empty-state-title">No highlights yet</div>
+        <div class="empty-state-sub">Load highlights for the selected player to see best moments.</div>
+      </div>
+    `;
+  }
+  const rows = highlights.map((h, idx) => `
+    <tr>
+      <td class="mono">${idx + 1}</td>
+      <td>${h.title || h.highlight_type || 'Highlight'}</td>
+      <td>${h.player || h.player_name || h.pov_player || '-'}</td>
+      <td>${h.highlight_type || h.type || '-'}</td>
+      <td class="mono">${h.round_number ?? h.round ?? '-'}</td>
+      <td class="mono">${h.anchor_tick ?? h.tick ?? '-'}</td>
+      <td class="mono">${h.score ?? h.priority ?? '-'}</td>
+      <td><button class="btn btn-secondary btn-queue-highlight" data-highlight-id="${h.highlight_id || ''}">Queue</button></td>
+    </tr>
+  `).join('');
+  return `
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>#</th><th>Moment</th><th>Player</th><th>Type</th><th>Round</th><th>Anchor Tick</th><th>Score</th><th>Action</th>
+        </tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table>
+  `;
+}
+
+function renderClipPlansTable(plans) {
+  if (!plans?.length) {
+    return `
+      <div class="empty-state">
+        <div class="empty-state-title">No clip plans yet</div>
+        <div class="empty-state-sub">Create clip plans after loading highlights.</div>
+      </div>
+    `;
+  }
+  const rows = plans.map((plan, idx) => `
+    <tr>
+      <td class="mono">${idx + 1}</td>
+      <td>${plan.title || plan.clip_plan_id || plan.source_highlight_id || 'Clip plan'}</td>
+      <td>${plan.player_name || plan.pov_player || '-'}</td>
+      <td>${plan.pov_mode || '-'}</td>
+      <td class="mono">${plan.round_number ?? '-'}</td>
+      <td class="mono">${plan.start_tick ?? '-'}</td>
+      <td class="mono">${plan.anchor_tick ?? '-'}</td>
+      <td class="mono">${plan.end_tick ?? '-'}</td>
+      <td><button class="btn btn-secondary btn-queue-clip-plan" data-plan-id="${plan.clip_plan_id}">Queue</button></td>
+    </tr>
+  `).join('');
+  return `
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>#</th><th>Plan</th><th>POV Player</th><th>POV Mode</th><th>Round</th><th>Start</th><th>Anchor</th><th>End</th><th>Action</th>
+        </tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table>
+  `;
+}
+
+function renderQueueJobsTable(jobs) {
+  if (!jobs?.length) {
+    return `
+      <div class="empty-state">
+        <div class="empty-state-title">Queue is empty</div>
+        <div class="empty-state-sub">Queue render jobs to see background processing here.</div>
+      </div>
+    `;
+  }
+  const rows = jobs.map((job) => `
+    <tr>
+      <td class="mono">${job.job_id || job.id || '-'}</td>
+      <td>${job.clip_plan_id || '-'}</td>
+      <td>${job.render_mode || '-'}</td>
+      <td>${job.status || '-'}</td>
+      <td class="mono">${job.retry_count ?? 0}</td>
+      <td>${job.error || job.last_error || '-'}</td>
+    </tr>
+  `).join('');
+  return `
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Job</th><th>Clip Plan</th><th>Mode</th><th>Status</th><th>Retry</th><th>Error</th>
+        </tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table>
+  `;
+}
+
+function renderCompletedClipsGrid(clips) {
+  if (!clips?.length) {
+    return `
+      <div class="empty-state">
+        <div class="empty-state-title">No completed clips yet</div>
+        <div class="empty-state-sub">Completed renders will appear here.</div>
+      </div>
+    `;
+  }
+  return `
+    <div class="clips-grid">
+      ${clips.map((clip) => `
+        <article class="clip-card">
+          <div class="clip-card-head">
+            <h3>${clip.clip_plan_id || clip.clip_id || 'Clip'}</h3>
+            <span class="badge badge-map">${clip.render_mode || 'clip'}</span>
+          </div>
+          <div class="clip-card-meta">
+            <div><strong>POV:</strong> ${clip.pov_player || '-'}</div>
+            <div><strong>Duration:</strong> ${clip.duration_s ?? '-'}s</div>
+            <div><strong>Status:</strong> ${clip.status || '-'}</div>
+          </div>
+          <div class="clip-card-actions">
+            ${clip.output_url ? `<a class="btn btn-primary" href="${clip.output_url}" target="_blank" rel="noopener">Open Clip</a>` : ''}
+            ${clip.metadata_path ? `<span class="status-text">${clip.clip_id || ''}</span>` : ''}
+          </div>
+        </article>
+      `).join('')}
+    </div>
+  `;
+}
+
+function renderClipsSections() {
+  const body = $('#clips-body');
+  if (!body) return;
+  const jobs = State.renderJobs || [];
+  const completed = State.completedClips || [];
+  const counts = {
+    pending: jobs.filter((j) => j.status === 'pending').length,
+    processing: jobs.filter((j) => j.status === 'processing').length,
+    completed: jobs.filter((j) => j.status === 'completed').length,
+    failed: jobs.filter((j) => j.status === 'failed').length,
+  };
+
+  body.innerHTML = `
+    <section class="section">
+      <div class="section-title">Queue Summary</div>
+      <div class="overview-stats-row">
+        <div class="overview-stat-card"><div class="osc-label">Pending</div><div class="osc-value">${counts.pending}</div></div>
+        <div class="overview-stat-card"><div class="osc-label">Processing</div><div class="osc-value">${counts.processing}</div></div>
+        <div class="overview-stat-card"><div class="osc-label">Completed Jobs</div><div class="osc-value">${counts.completed}</div></div>
+        <div class="overview-stat-card"><div class="osc-label">Failed Jobs</div><div class="osc-value">${counts.failed}</div></div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-title">Best Moments</div>
+      ${renderHighlightsTable(State.clipHighlights)}
+    </section>
+
+    <section class="section">
+      <div class="section-title">Clip Plans</div>
+      ${renderClipPlansTable(State.clipPlans)}
+    </section>
+
+    <section class="section">
+      <div class="section-title">Render Queue</div>
+      ${renderQueueJobsTable(jobs)}
+    </section>
+
+    <section class="section">
+      <div class="section-title">Completed Clips</div>
+      ${renderCompletedClipsGrid(completed)}
+    </section>
+  `;
+}
+
+async function refreshClipsStatus(opts = {}) {
+  if (!State.demoId) return;
+  const [queueRes, clipsRes] = await Promise.all([
+    API.getRenderStatus(State.demoId),
+    API.getClips(State.demoId),
+  ]);
+  State.renderJobs = queueRes.jobs || [];
+  State.completedClips = clipsRes.clips || [];
+  if (!opts.background) renderClipsSections();
+  else if ($('#view-clips')?.classList.contains('active')) renderClipsSections();
+}
+
+async function loadHighlightsForClips(opts = {}) {
+  if (!State.demoId) return;
+  const player = getClipsPlayerFilter();
+  const max = getClipsMax();
+  if (!opts.silent) setClipsStatus('Loading highlights...');
+  const res = await API.getHighlights(State.demoId, { player, max });
+  State.clipHighlights = res.highlights || [];
+  if (!opts.silent) setClipsStatus(`Loaded ${State.clipHighlights.length} highlights.`);
+}
+
+async function createClipPlansForClips() {
+  if (!State.demoId) return;
+  const player = getClipsPlayerFilter();
+  const max = getClipsMax();
+  setClipsStatus('Creating clip plans...');
+  const res = await API.createClipPlans(State.demoId, { player, max });
+  State.clipPlans = res.clip_plans || [];
+  setClipsStatus(`Created ${State.clipPlans.length} clip plans.`);
+}
+
+async function enqueueClipRenders() {
+  if (!State.demoId) return;
+  const player = getClipsPlayerFilter();
+  const max = getClipsMax();
+  setClipsStatus('Queueing render jobs...');
+  const res = await API.enqueueRender(State.demoId, { player, max });
+  const created = res.jobs_created || 0;
+  setClipsStatus(`Queued ${created} render job${created === 1 ? '' : 's'}.`);
+  await refreshClipsStatus();
+}
+
+async function enqueueSingleClipPlan(planId) {
+  if (!State.demoId) return;
+  const plan = (State.clipPlans || []).find((item) => item.clip_plan_id === planId);
+  if (!plan) {
+    throw new Error(`Clip plan not found: ${planId}`);
+  }
+  setClipsStatus(`Queueing clip ${plan.clip_plan_id}...`);
+  const res = await API.enqueueClipPlan(State.demoId, plan);
+  const jobId = res?.job?.job_id || '';
+  setClipsStatus(`Queued ${plan.clip_plan_id}${jobId ? ` as ${jobId}` : ''}.`);
+  await refreshClipsStatus();
+}
+
+async function enqueueSingleHighlight(highlightId) {
+  if (!State.demoId) return;
+  if (!highlightId) {
+    throw new Error('highlight_id missing');
+  }
+  if (!State.clipPlans?.length) {
+    await createClipPlansForClips();
+  }
+  let plan = (State.clipPlans || []).find((item) => item.highlight_id === highlightId);
+  if (!plan) {
+    await createClipPlansForClips();
+    plan = (State.clipPlans || []).find((item) => item.highlight_id === highlightId);
+  }
+  if (!plan) {
+    throw new Error(`No clip plan found for highlight ${highlightId}`);
+  }
+  await enqueueSingleClipPlan(plan.clip_plan_id);
+}
+
+async function renderClipsView() {
+  if (!State.demoId) return;
+  const body = $('#clips-body');
+  if (body) {
+    body.innerHTML = '<div class="loading-placeholder">Loading clips...</div>';
+  }
+  try {
+    if (State.clipHighlights === null) {
+      await loadHighlightsForClips({ silent: true });
+    }
+    await refreshClipsStatus();
+    renderClipsSections();
+    if (!State.clipPlans?.length && State.clipHighlights?.length) {
+      setClipsStatus('Highlights loaded. Create clip plans or queue render jobs.');
+    } else if (!State.clipHighlights?.length) {
+      setClipsStatus('Load highlights to begin generating clips.');
+    }
+  } catch (err) {
+    console.error('Clips view failed:', err);
+    if (body) {
+      body.innerHTML = `<div class="empty-state"><div class="empty-state-title">Failed to load clips</div><div class="empty-state-sub">${err.message}</div></div>`;
+    }
+    setClipsStatus(`Error: ${err.message}`, true);
+  }
+}
+
 // â”€â”€ Player analysis view â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 $('#btn-analyze').addEventListener('click', () => {
   const player = $('#player-select').value;
   if (player) analyzePlayer(player);
+});
+
+$('#btn-load-highlights')?.addEventListener('click', async () => {
+  try {
+    await loadHighlightsForClips();
+    renderClipsSections();
+  } catch (err) {
+    setClipsStatus(`Error: ${err.message}`, true);
+  }
+});
+
+$('#btn-create-clip-plans')?.addEventListener('click', async () => {
+  try {
+    await createClipPlansForClips();
+    renderClipsSections();
+  } catch (err) {
+    setClipsStatus(`Error: ${err.message}`, true);
+  }
+});
+
+$('#btn-enqueue-renders')?.addEventListener('click', async () => {
+  try {
+    if (!State.clipPlans?.length) {
+      await createClipPlansForClips();
+    }
+    await enqueueClipRenders();
+    renderClipsSections();
+  } catch (err) {
+    setClipsStatus(`Error: ${err.message}`, true);
+  }
+});
+
+$('#btn-refresh-clips')?.addEventListener('click', async () => {
+  try {
+    setClipsStatus('Refreshing clips...');
+    await refreshClipsStatus();
+    renderClipsSections();
+    setClipsStatus('Clip status refreshed.');
+  } catch (err) {
+    setClipsStatus(`Error: ${err.message}`, true);
+  }
+});
+
+$('#clips-body')?.addEventListener('click', async (event) => {
+  const planButton = event.target.closest('.btn-queue-clip-plan');
+  const highlightButton = event.target.closest('.btn-queue-highlight');
+  const button = planButton || highlightButton;
+  if (!button) return;
+  button.disabled = true;
+  try {
+    if (planButton) {
+      const planId = planButton.dataset.planId;
+      if (!planId) return;
+      await enqueueSingleClipPlan(planId);
+    } else if (highlightButton) {
+      const highlightId = highlightButton.dataset.highlightId;
+      if (!highlightId) return;
+      await enqueueSingleHighlight(highlightId);
+    }
+    renderClipsSections();
+  } catch (err) {
+    setClipsStatus(`Error: ${err.message}`, true);
+  } finally {
+    button.disabled = false;
+  }
+});
+
+$('#clips-player-select')?.addEventListener('change', () => {
+  State.clipHighlights = null;
+  State.clipPlans = null;
+  if ($('#view-clips')?.classList.contains('active')) {
+    renderClipsView();
+  }
+});
+
+$('#clips-max-select')?.addEventListener('change', () => {
+  State.clipHighlights = null;
+  State.clipPlans = null;
+  if ($('#view-clips')?.classList.contains('active')) {
+    renderClipsView();
+  }
 });
 
 async function analyzePlayer(playerName) {

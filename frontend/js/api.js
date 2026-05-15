@@ -98,5 +98,48 @@ const API = (() => {
     getScouting(demoId, targetTeam) {
       return POST(`/api/demo/${demoId}/scouting/${targetTeam}`);
     },
+
+    // ── Highlights & Clips ────────────────────────────────────────────
+
+    /** Get best moments/highlights from a parsed demo */
+    getHighlights(demoId, opts = {}) {
+      const player = opts.player ? `&player=${encodeURIComponent(opts.player)}` : '';
+      const max = opts.max || 20;
+      return GET(`/api/demo/${demoId}/highlights?max_results=${max}${player}`);
+    },
+
+    /** Generate clip plans from highlights */
+    createClipPlans(demoId, opts = {}) {
+      const player = opts.player ? `&player=${encodeURIComponent(opts.player)}` : '';
+      const max = opts.max || 10;
+      return POST(`/api/demo/${demoId}/clip-plans?max_clips=${max}${player}`);
+    },
+
+    /** Enqueue render jobs for best moments */
+    enqueueRender(demoId, opts = {}) {
+      const player = opts.player ? `&player=${encodeURIComponent(opts.player)}` : '';
+      const max = opts.max || 5;
+      return POST(`/api/demo/${demoId}/render/enqueue?max_clips=${max}${player}`);
+    },
+
+    /** Enqueue a single clip plan */
+    enqueueClipPlan(demoId, clipPlan) {
+      return POST(`/api/demo/${demoId}/render/enqueue-plan`, clipPlan);
+    },
+
+    /** Get render queue status for a demo */
+    getRenderStatus(demoId) {
+      return GET(`/api/demo/${demoId}/render/status`);
+    },
+
+    /** Get detailed render job status */
+    getRenderJob(jobId) {
+      return GET(`/api/render/job/${jobId}`);
+    },
+
+    /** List completed clips for a demo */
+    getClips(demoId) {
+      return GET(`/api/demo/${demoId}/clips`);
+    },
   };
 })();
