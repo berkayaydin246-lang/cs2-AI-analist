@@ -10,6 +10,11 @@ import json
 from pathlib import Path
 
 
+# Ekstra oyuncu alanlari — tick verisine yaw/armor/silah/kit bilgisi ekler.
+# awpy 2.x bunlari ancak player_props ile parse edilirse cikarir.
+PLAYER_PROPS = ["yaw", "armor_value", "active_weapon_name", "has_defuser", "has_helmet"]
+
+
 def parse_demo(demo_path: str) -> dict:
     """
     .dem dosyasÄ±nÄ± parse eder ve analiz iÃ§in gerekli veriyi Ã§Ä±karÄ±r.
@@ -17,7 +22,12 @@ def parse_demo(demo_path: str) -> dict:
     print(f"[+] Demo yÃ¼kleniyor: {demo_path}")
 
     demo = Demo(demo_path)
-    demo.parse()
+    try:
+        demo.parse(player_props=PLAYER_PROPS)
+    except Exception as exc:
+        print(f"[!] player_props ile parse basarisiz ({exc}); duz parse deneniyor")
+        demo = Demo(demo_path)
+        demo.parse()
 
     # awpy 2.x header
     map_name = "unknown"
@@ -41,17 +51,50 @@ def parse_demo(demo_path: str) -> dict:
         except Exception:
             return pd.DataFrame()
 
-    kills_df    = _to_df(demo.kills    if hasattr(demo, "kills")    else None)
-    damages_df  = _to_df(demo.damages  if hasattr(demo, "damages")  else None)
-    rounds_df   = _to_df(demo.rounds   if hasattr(demo, "rounds")   else None)
-    grenades_df = _to_df(demo.grenades if hasattr(demo, "grenades") else None)
-    shots_df    = _to_df(demo.shots    if hasattr(demo, "shots")    else None)
-    ticks_df    = _to_df(demo.ticks    if hasattr(demo, "ticks")    else None)
-    bomb_df     = _to_df(
-        demo.bomb if hasattr(demo, "bomb") else (
-            demo.bomb_events if hasattr(demo, "bomb_events") else None
-        )
-    )
+    def _attr_df(name: str) -> pd.DataFrame:
+        """awpy lazy-property'lerinden guvenli DataFrame cikarir (eksik event -> bos)."""
+        try:
+            return _to_df(getattr(demo, name, None))
+        except Exception:
+            return pd.DataFrame()
+
+    kills_df    = _attr_df("kills")
+    damages_df  = _attr_df("damages")
+    rounds_df   = _attr_df("rounds")
+    grenades_df = _attr_df("grenades")
+    shots_df    = _attr_df("shots")
+    ticks_df    = _attr_df("ticks")
+    smokes_df   = _attr_df("smokes")
+    infernos_df = _attr_df("infernos")
+    bomb_df     = _attr_df("bomb")
+    if bomb_df.empty:
+        bomb_df = _attr_df("bomb_events")
+
+    def _event_df(event_name: str) -> pd.DataFrame:
+        try:
+            events = getattr(demo, "events", None) or {}
+            return _to_df(events.get(event_name))
+        except Exception:
+            return pd.DataFrame()
+
+    flash_det_df = _event_df("flashbang_detonate")
+    he_det_df    = _event_df("hegrenade_detonate")
+
+    def _optional_event_df(event_name: str) -> pd.DataFrame:
+        """awpy'nin event listesinde olmayan eventleri demoparser2'den dogrudan ceker."""
+        try:
+            raw_parser = getattr(demo, "parser", None)
+            if raw_parser is None:
+                return pd.DataFrame()
+            res = raw_parser.parse_event(event_name)
+            if isinstance(res, pd.DataFrame):
+                return res
+        except Exception:
+            pass
+        return pd.DataFrame()
+
+    blind_df   = _optional_event_df("player_blind")
+    explode_df = _optional_event_df("bomb_exploded")
 
     total_rounds = len(rounds_df) if len(rounds_df) > 0 else 0
 
@@ -64,16 +107,23 @@ def parse_demo(demo_path: str) -> dict:
     kills_processed = _process_kills(kills_df)
     player_identities = _build_player_identities(player_positions, kills=kills_processed)
 
+    bomb_events = _process_bomb_events(bomb_df)
+    bomb_events.extend(_explode_events(explode_df, bomb_events))
+
+    shots = _process_shots(shots_df)
+    _enrich_shots_with_yaw(shots, player_positions)
+
     result = {
-        "schema_version": 10,
+        "schema_version": 11,
         "map":          map_name,
         "total_rounds": total_rounds,
         "map_bounds":   _extract_map_bounds(ticks_df),
         "kills":        kills_processed,
         "damages":      _process_damages(damages_df),
         "grenades":     _process_grenades(grenades_df),
-        "bomb_events":  _process_bomb_events(bomb_df),
-        "shots":        _process_shots(shots_df),
+        "bomb_events":  bomb_events,
+        "shots":        shots,
+        "effects":      _process_effects(smokes_df, infernos_df, flash_det_df, he_det_df, blind_df),
         "player_positions": player_positions,
         "player_identities": player_identities,
         "rounds":       _process_rounds(rounds_df),
@@ -232,9 +282,9 @@ def _process_shots(df: pd.DataFrame) -> list:
             cl = str(col).lower()
             if cl in ("player_name", "shooter_name", "attacker_name", "name"):
                 rename_map[col] = "shooter_name"
-            elif cl in ("x", "shot_x"):
+            elif cl in ("x", "shot_x", "player_x"):
                 rename_map[col] = "shot_x"
-            elif cl in ("y", "shot_y"):
+            elif cl in ("y", "shot_y", "player_y"):
                 rename_map[col] = "shot_y"
             elif cl in ("weapon", "weapon_name"):
                 rename_map[col] = "weapon"
@@ -242,7 +292,7 @@ def _process_shots(df: pd.DataFrame) -> list:
                 rename_map[col] = "tick"
             elif cl in ("round", "round_num"):
                 rename_map[col] = "round_num"
-            elif cl in ("side", "shooter_side"):
+            elif cl in ("side", "shooter_side", "player_side"):
                 rename_map[col] = "shooter_side"
         if rename_map:
             df = df.rename(columns=rename_map)
@@ -251,6 +301,50 @@ def _process_shots(df: pd.DataFrame) -> list:
                         "tick", "round_num", "shot_x", "shot_y"]
             if c in df.columns]
     return df[keep].fillna("").to_dict(orient="records")
+
+
+def _enrich_shots_with_yaw(shots: list, player_positions: list) -> None:
+    """Her atisa, atis aninda atan oyuncunun bakis yonunu (yaw) ekler.
+
+    Tick verisi ornekleme ile seyreltildigi icin en yakin ornek kullanilir
+    (maks ~8 tick / 125 ms sapma — 2D harita icin yeterli).
+    """
+    if not shots or not player_positions:
+        return
+    pos_df = pd.DataFrame(player_positions)
+    if not {"player_name", "tick", "yaw"}.issubset(pos_df.columns):
+        return
+    pos_df = pos_df.dropna(subset=["tick", "yaw"])
+    if pos_df.empty:
+        return
+
+    import numpy as np
+    by_player: dict[str, tuple] = {}
+    for name, g in pos_df.groupby("player_name"):
+        g = g.sort_values("tick")
+        by_player[str(name)] = (g["tick"].to_numpy(dtype=float), g["yaw"].to_numpy(dtype=float))
+
+    enriched = 0
+    for s in shots:
+        name = str(s.get("shooter_name") or "")
+        try:
+            tick = float(s.get("tick"))
+        except (TypeError, ValueError):
+            continue
+        entry = by_player.get(name)
+        if entry is None:
+            continue
+        ticks_arr, yaw_arr = entry
+        idx = int(np.searchsorted(ticks_arr, tick))
+        # En yakin ornegi sec (once/sonra)
+        best = idx
+        if idx >= len(ticks_arr):
+            best = len(ticks_arr) - 1
+        elif idx > 0 and (tick - ticks_arr[idx - 1]) < (ticks_arr[idx] - tick):
+            best = idx - 1
+        s["yaw"] = float(yaw_arr[best])
+        enriched += 1
+    print(f"[+] Shots yaw ile eslesti: {enriched}/{len(shots)}")
 
 
 def _process_ticks(df: pd.DataFrame, sample_step: int = 8) -> list:
@@ -323,8 +417,14 @@ def _process_ticks(df: pd.DataFrame, sample_step: int = 8) -> list:
                 rename_map[col] = "yaw"
             elif cl in ("hp", "health", "player_health"):
                 rename_map[col] = "hp"
-            elif cl in ("armor", "armour", "player_armor", "player_armour"):
+            elif cl in ("armor", "armour", "armor_value", "player_armor", "player_armour"):
                 rename_map[col] = "armor"
+            elif cl in ("active_weapon_name", "active_weapon", "weapon_name", "weapon"):
+                rename_map[col] = "weapon"
+            elif cl in ("has_defuser", "has_defuse_kit"):
+                rename_map[col] = "has_defuser"
+            elif cl in ("has_helmet",):
+                rename_map[col] = "has_helmet"
             elif cl in ("steamid", "steam_id", "steamid64", "steam64", "steam_id64", "player_steamid"):
                 rename_map[col] = "steamid"
         if rename_map:
@@ -373,7 +473,8 @@ def _process_ticks(df: pd.DataFrame, sample_step: int = 8) -> list:
                 lambda s: s.interpolate(limit_direction="both")
             )
 
-    keep = [c for c in ["player_name", "steamid", "x", "y", "side", "round_num", "tick", "yaw", "hp", "armor"] if c in sampled.columns]
+    keep = [c for c in ["player_name", "steamid", "x", "y", "side", "round_num", "tick",
+                        "yaw", "hp", "armor", "weapon", "has_defuser", "has_helmet"] if c in sampled.columns]
     rows = sampled[keep].to_dict(orient="records")
     print(f"[+] Player positions (sampled): {len(rows)}")
     return rows
@@ -446,6 +547,128 @@ def _process_bomb_events(df: pd.DataFrame) -> list:
         out = out[out["tick"] > 0]
         out["tick"] = out["tick"].astype(int)
     return out.fillna("").to_dict(orient="records")
+
+
+def _explode_events(df: pd.DataFrame, bomb_events: list) -> list:
+    """bomb_exploded eventlerini plant konumlariyla eslestirerek explode kaydi uretir."""
+    if df is None or len(df) == 0 or "tick" not in df.columns:
+        return []
+
+    plants = [b for b in bomb_events if b.get("event") == "plant" and b.get("tick")]
+    out = []
+    for _, r in df.iterrows():
+        try:
+            tick = int(float(r.get("tick")))
+        except (TypeError, ValueError):
+            continue
+        if tick <= 0:
+            continue
+        entry: dict = {"event": "explode", "tick": tick}
+        # Patlama konumu = son plant konumu (bomba plant edildigi yerde patlar)
+        prior = [p for p in plants if int(p["tick"]) <= tick]
+        if prior:
+            last = max(prior, key=lambda p: int(p["tick"]))
+            for key in ("x", "y", "round_num"):
+                if last.get(key) not in (None, ""):
+                    entry[key] = last[key]
+        out.append(entry)
+    if out:
+        print(f"[+] Bomb explode eventleri: {len(out)}")
+    return out
+
+
+def _process_effects(smokes_df: pd.DataFrame, infernos_df: pd.DataFrame,
+                     flash_df: pd.DataFrame, he_df: pd.DataFrame,
+                     blind_df: pd.DataFrame) -> list:
+    """Kalici alan efektlerini (smoke/molotov) ve patlama efektlerini (flash/he) cikarir.
+
+    - smoke/molotov: awpy smokes/infernos tablolari — start_tick/end_tick araligi boyunca
+      haritada alan olarak cizilir.
+    - flash: flashbang_detonate eventi + player_blind eventi (entityid ile join) —
+      patlama ani + kor olan oyuncular ve sureleri.
+    - he: hegrenade_detonate eventi — patlama ani.
+    """
+    effects: list = []
+
+    def _f(v, default=None):
+        try:
+            f = float(v)
+            if f != f:  # NaN
+                return default
+            return f
+        except (TypeError, ValueError):
+            return default
+
+    # ── Alan efektleri: smoke (~18 s) ve molotov (~7 s) ───────────────────────
+    for df, etype, default_life in ((smokes_df, "smoke", 18 * 64),
+                                    (infernos_df, "molotov", 7 * 64)):
+        if df is None or len(df) == 0:
+            continue
+        if not {"X", "Y", "start_tick"}.issubset(set(df.columns)):
+            continue
+        for _, r in df.iterrows():
+            start = _f(r.get("start_tick"))
+            x = _f(r.get("X"))
+            y = _f(r.get("Y"))
+            if not start or start <= 0 or x is None or y is None:
+                continue
+            end = _f(r.get("end_tick"))
+            if end is None or end <= start:
+                end = start + default_life
+            entry = {
+                "type": etype,
+                "x": x,
+                "y": y,
+                "start_tick": int(start),
+                "end_tick": int(end),
+                "thrower": str(r.get("thrower_name") or ""),
+            }
+            rn = _f(r.get("round_num"))
+            if rn and rn > 0:
+                entry["round_num"] = int(rn)
+            effects.append(entry)
+
+    # ── Blind sureleri: flash entityid -> etkilenen oyuncular ─────────────────
+    blinded_by_entity: dict[int, list] = {}
+    if blind_df is not None and len(blind_df) > 0 and "entityid" in blind_df.columns:
+        for _, r in blind_df.iterrows():
+            eid = _f(r.get("entityid"))
+            dur = _f(r.get("blind_duration")) or 0.0
+            name = str(r.get("user_name") or "")
+            if eid is None or not name or dur <= 0:
+                continue
+            blinded_by_entity.setdefault(int(eid), []).append(
+                {"player": name, "duration_s": round(dur, 3)}
+            )
+
+    # ── Patlama efektleri: flash ve HE ────────────────────────────────────────
+    for df, etype in ((flash_df, "flash"), (he_df, "he")):
+        if df is None or len(df) == 0:
+            continue
+        if not {"x", "y", "tick"}.issubset(set(df.columns)):
+            continue
+        for _, r in df.iterrows():
+            tick = _f(r.get("tick"))
+            x = _f(r.get("x"))
+            y = _f(r.get("y"))
+            if not tick or tick <= 0 or x is None or y is None:
+                continue
+            entry = {
+                "type": etype,
+                "x": x,
+                "y": y,
+                "tick": int(tick),
+                "thrower": str(r.get("user_name") or ""),
+            }
+            if etype == "flash":
+                eid = _f(r.get("entityid"))
+                entry["blinded"] = blinded_by_entity.get(int(eid), []) if eid is not None else []
+            effects.append(entry)
+
+    from collections import Counter
+    counts = Counter(e["type"] for e in effects)
+    print(f"[+] Effects: {dict(counts)}")
+    return effects
 
 
 def _extract_map_bounds(df: pd.DataFrame) -> dict:

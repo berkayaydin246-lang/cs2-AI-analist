@@ -1308,6 +1308,32 @@ img { display: block; max-width: 100%; }
 
 .replay-frame-counter { font-size: 12px; font-family: var(--font-mono); color: var(--text-muted); white-space: nowrap; }
 
+/* Event markers on the scrub track (kills, plant, defuse, explosion) */
+.scrubber-wrap { position: relative; }
+.scrubber-markers {
+  position: absolute;
+  left: 0; right: 0;
+  top: calc(50% + 7px);
+  height: 8px;
+  pointer-events: none;
+}
+.scrub-marker {
+  position: absolute;
+  top: 0;
+  width: 6px;
+  height: 6px;
+  margin-left: -3px;
+  border-radius: 50%;
+  pointer-events: auto;
+  cursor: pointer;
+  transition: transform var(--transition);
+}
+.scrub-marker:hover { transform: scale(1.6); }
+.scrub-marker.kill    { background: #ef4444; }
+.scrub-marker.plant   { background: #fb923c; box-shadow: 0 0 4px rgba(251,146,60,.8); }
+.scrub-marker.defuse  { background: #22c55e; box-shadow: 0 0 4px rgba(34,197,94,.8); }
+.scrub-marker.explode { background: #f97316; box-shadow: 0 0 6px rgba(249,115,22,.9); width: 8px; height: 8px; margin-left: -4px; }
+
 .replay-select {
   background: var(--bg-elevated);
   border: 1px solid var(--border);
@@ -1360,6 +1386,20 @@ img { display: block; max-width: 100%; }
   font-size: 12px;
 }
 .alive-player.dead { opacity: .4; }
+.alive-player { cursor: pointer; transition: background var(--transition); }
+.alive-player:hover { background: var(--bg-elevated); }
+.alive-player.selected {
+  background: rgba(251, 146, 60, 0.12);
+  outline: 1px solid rgba(251, 146, 60, 0.55);
+}
+.alive-weapon {
+  font-size: 10px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 70px;
+}
 .alive-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
 .alive-dot.t  { background: var(--t-side); }
 .alive-dot.ct { background: var(--ct-side); }

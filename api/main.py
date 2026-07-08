@@ -34,6 +34,14 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE_DIR))
 load_dotenv(dotenv_path=BASE_DIR / ".env")
 
+# Windows consoles often use cp125x — a print() of a player name with e.g.
+# Cyrillic characters would raise UnicodeEncodeError and abort the request.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(errors="replace")
+    except (AttributeError, OSError):
+        pass
+
 from src.analyzer import analyze_player          # noqa: E402
 from src.clip_planner import plan_clips          # noqa: E402
 from src.coach import get_coaching, get_scouting_report  # noqa: E402
@@ -72,7 +80,7 @@ app.mount("/generated", StaticFiles(directory=str(GENERATED_DIR)), name="generat
 # In-memory session store: demo_id -> session dict
 _sessions: dict[str, dict[str, Any]] = {}
 MAX_SESSION_COUNT = 20
-REQUIRED_SCHEMA_VERSION = 10
+REQUIRED_SCHEMA_VERSION = 11
 STEAM_FAILURE_CACHE_TTL_SEC = 30
 
 
@@ -105,6 +113,18 @@ def _safe_int(v: Any, default: int = 0) -> int:
         return int(float(v))
     except (TypeError, ValueError):
         return default
+
+
+def _safe_bool(v: Any) -> bool:
+    if isinstance(v, bool):
+        return v
+    if v in (None, ""):
+        return False
+    try:
+        f = float(v)
+        return f == f and f != 0.0  # NaN -> False
+    except (TypeError, ValueError):
+        return str(v).strip().lower() in ("true", "1", "yes")
 
 
 GRENADE_FLIGHT_TICKS = {
@@ -405,11 +425,7 @@ def radar(map_name: str):
                 return Response(f.read(), media_type="image/png")
     except Exception:
         pass
-    legacy = BASE_DIR / "De_mirage_radar.webp"
-    if map_name == "de_mirage" and legacy.exists():
-        with open(legacy, "rb") as f:
-            return Response(f.read(), media_type="image/webp")
-    raise HTTPException(404, detail="Radar image not found")
+    raise HTTPException(404, detail="Radar image not found — run 'awpy get maps' once")
 
 
 # â”€â”€ Player analysis â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -706,6 +722,8 @@ def replay_round(demo_id: str, round_num: int):
             continue
         hp_raw = pos.get("hp")
         yaw_raw = pos.get("yaw")
+        armor_raw = pos.get("armor")
+        weapon_raw = pos.get("weapon")
         tracks_by_player[name].append(
             {
                 "tick": tick,
@@ -714,6 +732,10 @@ def replay_round(demo_id: str, round_num: int):
                 "side": _norm_side(pos.get("side")),
                 "hp": _safe(hp_raw, 100.0) if hp_raw not in (None, "", "nan") else 100.0,
                 "yaw": _safe(yaw_raw) if yaw_raw not in (None, "", "nan") else None,
+                "armor": _safe(armor_raw, 0.0) if armor_raw not in (None, "", "nan") else 0.0,
+                "weapon": str(weapon_raw) if weapon_raw not in (None, "nan") and weapon_raw == weapon_raw else "",
+                "defuser": _safe_bool(pos.get("has_defuser")),
+                "helmet": _safe_bool(pos.get("has_helmet")),
             }
         )
 
@@ -779,7 +801,13 @@ def replay_round(demo_id: str, round_num: int):
         if yaw is None:
             yaw = p1.get("yaw")
         side = p2.get("side") or p1.get("side") or ""
-        return {"x": x, "y": y, "hp": hp, "yaw": yaw, "side": side}
+        return {
+            "x": x, "y": y, "hp": hp, "yaw": yaw, "side": side,
+            "armor": p2.get("armor", p1.get("armor", 0.0)),
+            "weapon": p2.get("weapon") or p1.get("weapon") or "",
+            "defuser": bool(p2.get("defuser", False)),
+            "helmet": bool(p2.get("helmet", False)),
+        }
 
     frames = []
     for t in frame_ticks:
@@ -796,6 +824,10 @@ def replay_round(demo_id: str, round_num: int):
                     "side": st["side"],
                     "hp": st["hp"],
                     "yaw": st["yaw"],
+                    "armor": st["armor"],
+                    "weapon": st["weapon"],
+                    "defuser": st["defuser"],
+                    "helmet": st["helmet"],
                 }
             )
         frames.append({"tick": t, "players": players})
@@ -929,6 +961,75 @@ def replay_round(demo_id: str, round_num: int):
         )
     grenades_out.sort(key=lambda x: x.get("tick", 0))
 
+    # Shots (bullet tracers) — shooter position + view direction at fire tick
+    shots_out = []
+    for sh in parsed.get("shots", []):
+        tick = _safe_int(sh.get("tick"))
+        if not _event_in_round(_safe_int(sh.get("round_num"), 0), tick):
+            continue
+        x = sh.get("shot_x")
+        y = sh.get("shot_y")
+        if x in (None, "") or y in (None, ""):
+            continue
+        yaw_raw = sh.get("yaw")
+        shots_out.append(
+            {
+                "tick": tick,
+                "x": _safe(x),
+                "y": _safe(y),
+                "yaw": _safe(yaw_raw) if yaw_raw not in (None, "") else None,
+                "shooter": str(sh.get("shooter_name") or ""),
+                "side": str(sh.get("shooter_side") or ""),
+                "weapon": str(sh.get("weapon") or ""),
+            }
+        )
+    shots_out.sort(key=lambda x: x.get("tick", 0))
+
+    # Persistent/area effects (smoke, molotov) + detonations (flash, he)
+    effects_out = []
+    for ef in parsed.get("effects", []):
+        etype = str(ef.get("type") or "")
+        x = ef.get("x")
+        y = ef.get("y")
+        if x in (None, "") or y in (None, ""):
+            continue
+        if etype in ("smoke", "molotov"):
+            start = _safe_int(ef.get("start_tick"))
+            end = _safe_int(ef.get("end_tick"))
+            ef_round = _safe_int(ef.get("round_num"), 0)
+            if not _event_in_round(ef_round, start):
+                continue
+            effects_out.append(
+                {
+                    "type": etype,
+                    "x": _safe(x),
+                    "y": _safe(y),
+                    "start_tick": start,
+                    "end_tick": max(end, start),
+                    "thrower": str(ef.get("thrower") or ""),
+                }
+            )
+        elif etype in ("flash", "he"):
+            tick = _safe_int(ef.get("tick"))
+            if not _event_in_round(0, tick):
+                continue
+            entry = {
+                "type": etype,
+                "x": _safe(x),
+                "y": _safe(y),
+                "tick": tick,
+                "thrower": str(ef.get("thrower") or ""),
+            }
+            if etype == "flash":
+                blinded = ef.get("blinded")
+                entry["blinded"] = [
+                    {"player": str(b.get("player") or ""), "duration_s": _safe(b.get("duration_s"))}
+                    for b in (blinded if isinstance(blinded, list) else [])
+                    if isinstance(b, dict)
+                ]
+            effects_out.append(entry)
+    effects_out.sort(key=lambda x: x.get("start_tick", x.get("tick", 0)))
+
     return {
         "round": round_num,
         "map": map_name,
@@ -936,6 +1037,8 @@ def replay_round(demo_id: str, round_num: int):
         "kills": kills,
         "bombs": bombs,
         "grenades": grenades_out,
+        "shots": shots_out,
+        "effects": effects_out,
         "round_bounds": [round_tick_min, round_tick_max],
         "tick_range": [frame_ticks[0], frame_ticks[-1]],
         "frame_count": len(frames),

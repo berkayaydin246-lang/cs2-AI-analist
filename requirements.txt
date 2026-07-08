@@ -1,4 +1,6 @@
 awpy==2.0.2
+# 0.41.1 fails with EntityNotFound on 2026-era CS2 demos (patch 14165+)
+demoparser2>=0.41.4
 anthropic>=0.25.0
 python-dotenv>=1.0.0
 fastapi>=0.111.0

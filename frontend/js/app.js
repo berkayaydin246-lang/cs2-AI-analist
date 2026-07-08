@@ -348,6 +348,8 @@ function resetDemoScopedState() {
     scrubber.max = '0';
     scrubber.value = '0';
   }
+  const scrubMarkers = $('#rp-scrubber-markers');
+  if (scrubMarkers) scrubMarkers.innerHTML = '';
   const frameCounter = $('#rp-frame-counter');
   if (frameCounter) frameCounter.textContent = '0 / 0';
 
@@ -1841,6 +1843,13 @@ async function loadReplayRound(roundNum) {
     replayEngine.onPlayStateChange = (playing) => {
       $('#rp-play').innerHTML = playing ? '&#9646;&#9646;' : '&#9654;';
     };
+    replayEngine.onPlayerSelect = (name) => {
+      $$('#alive-panel .alive-player').forEach(row => {
+        row.classList.toggle('selected', Boolean(name) && row.dataset.player === name);
+      });
+    };
+
+    renderScrubberMarkers(data);
 
     // Show round tags for this round (only economy tags)
     const SHOWN_TAGS = new Set(['pistol','eco_t','eco_ct','force_t','force_ct','full_buy','anti_eco','ace']);
@@ -1886,13 +1895,53 @@ function updateAlivePanelFromFrame(data, frameIdx) {
     const isT   = p.side !== 'CT';
     const hp    = Math.max(0, p.hp);
     const hpCls = hp > 60 ? '' : hp > 30 ? ' low' : ' crit';
-    const row = el('div', `alive-player${dead ? ' dead' : ''}`);
+    const weapon = String(p.weapon || '').replace(/^weapon_/, '');
+    const selected = replayEngine?.selectedPlayer === p.name;
+    const row = el('div', `alive-player${dead ? ' dead' : ''}${selected ? ' selected' : ''}`);
+    row.dataset.player = p.name;
     row.innerHTML = `
       <span class="alive-dot ${isT ? 't' : 'ct'}"></span>
       <span class="alive-name">${p.name}</span>
+      ${!dead && weapon ? `<span class="alive-weapon">${weapon}</span>` : ''}
       ${!dead ? `<span class="alive-hp${hpCls}">${Math.round(hp)}</span>` : ''}
     `;
+    // Click focuses this player on the map (toggle)
+    row.addEventListener('click', () => {
+      if (!replayEngine) return;
+      replayEngine.setSelectedPlayer(
+        replayEngine.selectedPlayer === p.name ? null : p.name
+      );
+    });
     panel.appendChild(row);
+  });
+}
+
+/** Render kill / bomb event markers on the scrubber track. */
+function renderScrubberMarkers(data) {
+  const wrap = $('#rp-scrubber-markers');
+  if (!wrap) return;
+  wrap.innerHTML = '';
+  const [t0, t1] = data.tick_range || [0, 0];
+  const span = Math.max(t1 - t0, 1);
+
+  const addMarker = (tick, cls, title) => {
+    if (tick == null || tick < t0 || tick > t1) return;
+    const pct = ((tick - t0) / span) * 100;
+    const m = el('div', `scrub-marker ${cls}`);
+    m.style.left = `${pct}%`;
+    m.title = title;
+    m.addEventListener('click', () => replayEngine?.seekToTick(tick));
+    wrap.appendChild(m);
+  };
+
+  (data.kills || []).forEach(k => {
+    addMarker(k.tick, 'kill', `${k.attacker} ▸ ${k.victim} (${k.weapon})`);
+  });
+  (data.bombs || []).forEach(b => {
+    const evt = String(b.event || '').toLowerCase();
+    if (evt === 'plant')            addMarker(b.tick, 'plant', `Bomb planted — ${b.player}`);
+    else if (evt.includes('defus') && !evt.includes('start')) addMarker(b.tick, 'defuse', `Bomb defused — ${b.player}`);
+    else if (evt.includes('explode')) addMarker(b.tick, 'explode', 'Bomb exploded');
   });
 }
 

@@ -27,7 +27,10 @@ _MAP_INFO = {
 
 
 def _load_radar_img(map_name: str, grid_size: int = 1024):
-    """Loads radar image: prefers awpy PNG (with alpha), falls back to legacy webp."""
+    """Loads the official awpy radar PNG (with alpha) for any map.
+
+    Requires `awpy get maps` to have been run once (downloads to ~/.awpy/maps).
+    """
     try:
         import awpy.data
         p = awpy.data.MAPS_DIR / f"{map_name}.png"
@@ -38,14 +41,7 @@ def _load_radar_img(map_name: str, grid_size: int = 1024):
             return img
     except Exception:
         pass
-    project_root = Path(__file__).resolve().parent.parent
-    if map_name == "de_mirage":
-        lp = project_root / "De_mirage_radar.webp"
-        if lp.exists():
-            img = Image.open(lp).convert("RGBA")
-            if img.size != (grid_size, grid_size):
-                img = img.resize((grid_size, grid_size), Image.LANCZOS)
-            return img
+    print(f"[!] Radar haritasi bulunamadi: {map_name}. 'awpy get maps' komutuyla indirebilirsiniz.")
     return None
 
 
@@ -209,18 +205,11 @@ def plot_death_heatmap(positions: list, map_name: str, player_name: str,
         py = (pos_y - y) / scale
         return px, py
 
-    # Harita radar görselini yükle
+    # Harita radar görselini yükle (awpy PNG — tüm haritalar için çalışır)
     fig, ax = plt.subplots(figsize=(10, 10))
-    radar_map = {
-        "de_mirage": "De_mirage_radar.webp",
-    }
-    radar_file = radar_map.get(map_name)
-    project_root = Path(__file__).resolve().parent.parent
-    radar_path = project_root / radar_file if radar_file else None
-
-    if radar_path and radar_path.exists():
-        img = Image.open(radar_path)
-        ax.imshow(img, extent=[0, 1024, 1024, 0], aspect="equal")
+    radar_img = _load_radar_img(map_name)
+    if radar_img is not None:
+        ax.imshow(radar_img, extent=[0, 1024, 1024, 0], aspect="equal")
     else:
         try:
             from awpy.plot import plot_map
@@ -443,40 +432,11 @@ def plot_player_activity_map(
         print("[!] Oyuncu movement verisi bulunamadi.")
         return None
 
-    # Radar dosyasini yukle — oncelik sirasi:
-    #   1. awpy'nin indirdigi RGBA PNG (~/.awpy/maps/<map>.png) — alpha kanali ideal maske saglar
-    #   2. Proje kokündeki eski webp dosyasi (fallback)
-    #   3. Yok ise sadece karanlik arka plan kullanilir
-    try:
-        import awpy.data
-        awpy_map_path = awpy.data.MAPS_DIR / f"{map_name}.png"
-    except Exception:
-        awpy_map_path = None
-
-    project_root = Path(__file__).resolve().parent.parent
-    legacy_radar_file = "De_mirage_radar.webp" if map_name == "de_mirage" else None
-    legacy_radar_path = project_root / legacy_radar_file if legacy_radar_file else None
-
+    # Radar dosyasi: awpy'nin indirdigi RGBA PNG (~/.awpy/maps/<map>.png).
+    # Alpha kanali harita sinirini piksel hassasiyetinde tanimlar (ideal maske).
     grid_w, grid_h = 1024, 1024
-    radar_img = None
-    radar_has_alpha = False
-
-    if awpy_map_path and awpy_map_path.exists():
-        radar_img = Image.open(awpy_map_path).convert("RGBA")
-        radar_has_alpha = True
-        print(f"[+] awpy radar haritasi kullaniliyor: {awpy_map_path.name}")
-    elif legacy_radar_path and legacy_radar_path.exists():
-        radar_img = Image.open(legacy_radar_path).convert("RGBA")
-        radar_has_alpha = False
-        print(f"[+] Proje radar haritasi kullaniliyor: {legacy_radar_path.name}")
-    else:
-        print("[!] Radar haritasi bulunamadi. 'awpy get maps' komutuyla indirebilirsiniz.")
-
-    if radar_img is not None:
-        img_w, img_h = radar_img.size
-        if (img_w, img_h) != (grid_w, grid_h):
-            radar_img = radar_img.resize((grid_w, grid_h), Image.LANCZOS)
-            print(f"[*] Radar {img_w}x{img_h} -> {grid_w}x{grid_h} olceklendi.")
+    radar_img = _load_radar_img(map_name, grid_size=grid_w)
+    radar_has_alpha = radar_img is not None
 
     map_info = {
         "de_mirage": {"pos_x": -3230, "pos_y": 1713, "scale": 5.0},
@@ -679,25 +639,9 @@ def create_round_route_gif(
     """
     import io
 
-    # --- Radar image yukle (heatmap ile ayni oncelik sirasi) ---
-    try:
-        import awpy.data
-        awpy_map_path = awpy.data.MAPS_DIR / f"{map_name}.png"
-    except Exception:
-        awpy_map_path = None
-
-    project_root = Path(__file__).resolve().parent.parent
-    legacy_path = project_root / "De_mirage_radar.webp" if map_name == "de_mirage" else None
-
-    radar_img = None
-    if awpy_map_path and awpy_map_path.exists():
-        radar_img = Image.open(awpy_map_path).convert("RGBA")
-    elif legacy_path and legacy_path.exists():
-        radar_img = Image.open(legacy_path).convert("RGBA")
-
+    # --- Radar image yukle (awpy PNG — tum haritalar) ---
     GW, GH = 1024, 1024
-    if radar_img and radar_img.size != (GW, GH):
-        radar_img = radar_img.resize((GW, GH), Image.LANCZOS)
+    radar_img = _load_radar_img(map_name, grid_size=GW)
 
     # --- Koordinat donusumu ---
     map_info = {
