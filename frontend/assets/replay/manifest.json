@@ -1,0 +1,38 @@
+{
+  "icons": {
+    "smoke": "/static/assets/replay/icons/smoke-clean.png",
+    "flash": "/static/assets/replay/icons/flash.png",
+    "he": "/static/assets/replay/icons/grenade-clean.png",
+    "molotov": "/static/assets/replay/icons/molotov.png",
+    "decoy": "/static/assets/replay/icons/grenade-clean.png"
+  },
+  "weapons": {
+    "ak47": "/static/assets/replay/weapons/ak47-clean.png",
+    "awp": "/static/assets/replay/weapons/awp-clean.png",
+    "deagle": "/static/assets/replay/weapons/deagle-clean.png",
+    "m4a1": "/static/assets/replay/weapons/m4a1-clean.png",
+    "m4a4": "/static/assets/replay/weapons/m4a4-clean.png",
+    "ssg": "/static/assets/replay/weapons/ssg-clean.png",
+    "usp": "/static/assets/replay/weapons/usp-clean.png"
+  },
+  "effects": {
+    "heExplosion": {
+      "src": "/static/assets/replay/effects/grenadeeffect-clean.png",
+      "frames": 8,
+      "alpha": 1,
+      "scale": 1.18
+    },
+    "molotovFire": {
+      "src": "/static/assets/replay/effects/molotoveffect-clean.png",
+      "frames": 8,
+      "alpha": 0.82,
+      "scale": 1.05
+    },
+    "smokePuff": {
+      "src": "/static/assets/replay/effects/smokeeffect-clean.png",
+      "frames": 1,
+      "alpha": 0.72,
+      "scale": 1.15
+    }
+  }
+}

@@ -80,7 +80,7 @@ app.mount("/generated", StaticFiles(directory=str(GENERATED_DIR)), name="generat
 # In-memory session store: demo_id -> session dict
 _sessions: dict[str, dict[str, Any]] = {}
 MAX_SESSION_COUNT = 20
-REQUIRED_SCHEMA_VERSION = 11
+REQUIRED_SCHEMA_VERSION = 12
 STEAM_FAILURE_CACHE_TTL_SEC = 30
 
 
@@ -98,7 +98,7 @@ def _parsed(demo_id: str) -> tuple[dict, dict]:
     s = _sess(demo_id)
     if "parsed_data" not in s:
         raise HTTPException(400, detail="Demo not parsed yet â€” POST /api/demo/{id}/parse first")
-    return s, s["parsed_data"]
+    return s, _ensure_session_parsed_schema(s)
 
 
 def _safe(v: Any, default: float = 0.0) -> float:
@@ -148,6 +148,8 @@ def _round_meta_bounds(parsed: dict, round_num: int) -> tuple[int, int] | None:
         if end <= 0:
             end = _safe_int(r.get("end"), 0)
         if start <= 0:
+            start = freeze_end
+        if freeze_end > start:
             start = freeze_end
         if start > 0 and end >= start:
             return (start, end)
@@ -761,12 +763,14 @@ def replay_round(demo_id: str, round_num: int):
     else:
         round_tick_min, round_tick_max = raw_tick_min, raw_tick_max
 
-    # Build an evenly spaced round timeline so frame->tick mapping is stable.
+    # Build a high-resolution timeline from live action onward. Four ticks per
+    # frame keeps utility/tracers readable without sending an unbounded payload.
     if round_tick_max < round_tick_min:
         round_tick_max = round_tick_min
-    max_frames = 300
+    target_step_ticks = 4
+    max_frames = 1800
     span = max(round_tick_max - round_tick_min, 1)
-    step = max(1, math.ceil(span / max(max_frames - 1, 1)))
+    step = max(target_step_ticks, math.ceil(span / max(max_frames - 1, 1)))
     frame_ticks = list(range(round_tick_min, round_tick_max + 1, step))
     if frame_ticks[-1] != round_tick_max:
         frame_ticks.append(round_tick_max)
@@ -835,12 +839,20 @@ def replay_round(demo_id: str, round_num: int):
     def _event_in_round(event_round: int, event_tick: int) -> bool:
         if event_tick <= 0:
             return False
+        in_tick_bounds = round_tick_min <= event_tick <= round_tick_max
         if event_round > 0:
-            if event_round == round_num:
-                return True
-            # Some schemas may carry noisy round_num; keep tick-bound fallback.
-            return round_tick_min <= event_tick <= round_tick_max
-        return round_tick_min <= event_tick <= round_tick_max
+            return event_round == round_num and in_tick_bounds
+        return in_tick_bounds
+
+    def _is_bullet_weapon(weapon: str) -> bool:
+        normalized = str(weapon or "").strip().lower().replace("weapon_", "").replace("-", "").replace(" ", "")
+        if not normalized:
+            return False
+        non_bullet_tokens = (
+            "knife", "bayonet", "karambit", "c4", "bomb", "flashbang", "smokegrenade",
+            "hegrenade", "molotov", "incgrenade", "decoy", "grenade", "taser", "zeus",
+        )
+        return not any(token in normalized for token in non_bullet_tokens)
 
     # Kills
     kills = []
@@ -884,21 +896,205 @@ def replay_round(demo_id: str, round_num: int):
         )
     bombs.sort(key=lambda x: x.get("tick", 0))
 
+    def _grenade_effect_type(gtype: str) -> str:
+        normalized = str(gtype or "").strip().lower()
+        if normalized in ("he", "he_grenade", "hegrenade"):
+            return "he"
+        if normalized in ("molotov", "incendiary", "incgrenade"):
+            return "molotov"
+        if normalized in ("smoke", "smokegrenade"):
+            return "smoke"
+        if normalized in ("flash", "flashbang"):
+            return "flash"
+        return normalized
+
+    def _grenade_anchor_window_ticks(gtype: str) -> int:
+        etype = _grenade_effect_type(gtype)
+        if etype in ("flash", "he"):
+            return 360
+        if etype == "molotov":
+            return 900
+        if etype == "smoke":
+            return 2400
+        return 900
+
+    effect_anchors: list[dict[str, Any]] = []
+    for idx, ef in enumerate(parsed.get("effects", [])):
+        etype = str(ef.get("type") or "").strip().lower()
+        if etype not in ("smoke", "molotov", "flash", "he"):
+            continue
+        tick = _safe_int(ef.get("start_tick", ef.get("tick")))
+        if tick <= 0:
+            tick = _safe_int(ef.get("tick"))
+        if not _event_in_round(_safe_int(ef.get("round_num"), 0), tick):
+            continue
+        x = ef.get("x")
+        y = ef.get("y")
+        if x in (None, "") or y in (None, ""):
+            continue
+        effect_anchors.append(
+            {
+                "idx": idx,
+                "type": etype,
+                "tick": tick,
+                "x": _safe(x),
+                "y": _safe(y),
+                "thrower": str(ef.get("thrower") or ""),
+            }
+        )
+
+    used_effect_anchors: set[int] = set()
+
+    def _match_effect_anchor(
+        gtype: str,
+        thrower: str,
+        end_x: float,
+        end_y: float,
+        candidate_tick: int,
+    ) -> dict[str, Any] | None:
+        etype = _grenade_effect_type(gtype)
+        if etype not in ("smoke", "molotov", "flash", "he"):
+            return None
+        max_delay = _grenade_anchor_window_ticks(gtype)
+        best = None
+        best_score = float("inf")
+        for anchor in effect_anchors:
+            if anchor["idx"] in used_effect_anchors or anchor["type"] != etype:
+                continue
+            if thrower and anchor["thrower"] and anchor["thrower"] != thrower:
+                continue
+            if candidate_tick > 0:
+                delay = int(anchor["tick"]) - candidate_tick
+                if delay < -16 or delay > max_delay:
+                    continue
+            else:
+                delay = 0
+            dist = math.hypot(float(anchor["x"]) - end_x, float(anchor["y"]) - end_y)
+            if dist > 500:
+                continue
+            score = dist + max(0, delay) * 0.03
+            if score < best_score:
+                best = anchor
+                best_score = score
+        if best is not None:
+            used_effect_anchors.add(best["idx"])
+        return best
+
+    def _weapon_grenade_type(weapon: str) -> str | None:
+        normalized = str(weapon or "").strip().lower().replace("weapon_", "")
+        compact = normalized.replace("-", "").replace("_", "").replace(" ", "")
+        if not compact:
+            return None
+        if "smoke" in compact:
+            return "smoke"
+        if "flash" in compact:
+            return "flash"
+        if "molotov" in compact or "incendiary" in compact or "incgrenade" in compact:
+            return "molotov"
+        if compact in ("he", "hegrenade") or "hegrenade" in compact or "high explosive" in normalized:
+            return "he"
+        return None
+
+    def _player_state_at_tick(player: str, tick: int) -> dict[str, Any] | None:
+        track = tracks_by_player.get(player)
+        if not track:
+            return None
+        return _interp_state(track, track_ticks_cache.get(player, []), tick)
+
+    def _infer_grenade_throw_from_weapon(
+        thrower: str,
+        gtype: str,
+        detonate_tick: int,
+        fallback_tick: int,
+    ) -> tuple[int, dict[str, Any] | None]:
+        """Use the thrower's weapon state to place utility at the real release tick."""
+        desired = _grenade_effect_type(gtype)
+        if desired not in ("smoke", "molotov", "flash", "he") or not thrower:
+            return fallback_tick, _player_state_at_tick(thrower, fallback_tick)
+
+        track = tracks_by_player.get(thrower)
+        if not track:
+            return fallback_tick, None
+
+        # Scope-style utility starts when the grenade leaves the hand, not when
+        # the projectile/effect table first reports a stable endpoint.
+        max_lookback_ticks = 960
+        lower_tick = max(round_tick_min, detonate_tick - max_lookback_ticks)
+        best_segment: tuple[int, int, int | None] | None = None
+        in_segment = False
+        seg_start = 0
+        seg_end = 0
+
+        for pt in track:
+            ptick = _safe_int(pt.get("tick"))
+            if ptick < lower_tick:
+                continue
+            if ptick > detonate_tick:
+                break
+
+            is_match = _weapon_grenade_type(pt.get("weapon", "")) == desired
+            if is_match:
+                if not in_segment:
+                    in_segment = True
+                    seg_start = ptick
+                seg_end = ptick
+                continue
+
+            if in_segment:
+                # First non-grenade sample after holding the utility is the
+                # closest sampled release moment.
+                best_segment = (seg_start, seg_end, ptick)
+                in_segment = False
+
+        if in_segment:
+            best_segment = (seg_start, seg_end, None)
+
+        if best_segment is None:
+            return fallback_tick, _player_state_at_tick(thrower, fallback_tick)
+
+        seg_start, end_tick, release_tick = best_segment
+        release_lead_ticks = 16
+        if release_tick is not None:
+            inferred_tick = max(seg_start, release_tick - release_lead_ticks)
+        else:
+            inferred_tick = end_tick
+        inferred_tick = min(max(round_tick_min, inferred_tick), max(round_tick_min, detonate_tick - 1))
+        return inferred_tick, _player_state_at_tick(thrower, inferred_tick)
+
+    def _best_grenade_path_segment(points: list[list[float]], end_x: float, end_y: float) -> list[list[float]]:
+        if len(points) < 3:
+            return points
+        segments: list[list[list[float]]] = []
+        current: list[list[float]] = [points[0]]
+        for prev, cur in zip(points, points[1:]):
+            if math.hypot(float(cur[0]) - float(prev[0]), float(cur[1]) - float(prev[1])) > 650:
+                if len(current) >= 2:
+                    segments.append(current)
+                current = [cur]
+            else:
+                current.append(cur)
+        if len(current) >= 2:
+            segments.append(current)
+        if not segments:
+            return points
+        return min(
+            segments,
+            key=lambda seg: math.hypot(float(seg[-1][0]) - end_x, float(seg[-1][1]) - end_y),
+        )
+
     # Grenade events
     grenades_out = []
     seen_grenade_keys: set = set()
     for g in parsed.get("grenades", []):
-        tick = _safe_int(g.get("tick"))
-        if not _event_in_round(_safe_int(g.get("round_num"), 0), tick):
-            continue
-
         gtype = str(g.get("grenade_type") or "unknown").strip().lower() or "unknown"
         thrower = str(g.get("thrower_name") or "")
-
-        dedup_key = (thrower, gtype, tick)
-        if dedup_key in seen_grenade_keys:
+        original_tick = _safe_int(g.get("tick"))
+        original_round = _safe_int(g.get("round_num"), 0)
+        if original_round > 0:
+            if original_round != round_num:
+                continue
+        elif original_tick > 0 and not (round_tick_min - _grenade_anchor_window_ticks(gtype) <= original_tick <= round_tick_max):
             continue
-        seen_grenade_keys.add(dedup_key)
 
         start_x = g.get("nade_start_x", g.get("nade_x", g.get("x")))
         start_y = g.get("nade_start_y", g.get("nade_y", g.get("y")))
@@ -940,7 +1136,40 @@ def replay_round(demo_id: str, round_num: int):
             ex, ey = path_points[-1]
 
         flight_ticks = GRENADE_FLIGHT_TICKS.get(gtype, 96)
-        detonate_tick = tick + flight_ticks
+        throw_state = None
+        anchor = _match_effect_anchor(gtype, thrower, ex, ey, original_tick)
+        if anchor is not None:
+            detonate_tick = int(anchor["tick"])
+            fallback_tick = max(round_tick_min, detonate_tick - flight_ticks)
+            etype = _grenade_effect_type(gtype)
+            if etype in ("flash", "he") and original_tick > 0:
+                tick = original_tick
+            else:
+                tick, throw_state = _infer_grenade_throw_from_weapon(thrower, gtype, detonate_tick, fallback_tick)
+            ex = float(anchor["x"])
+            ey = float(anchor["y"])
+            flight_ticks = max(1, detonate_tick - tick)
+        else:
+            tick = original_tick
+            if not _event_in_round(_safe_int(g.get("round_num"), 0), tick):
+                continue
+            detonate_tick = tick + flight_ticks
+
+        path_points = _best_grenade_path_segment(path_points, ex, ey)
+        if throw_state is not None:
+            sx = float(throw_state["x"])
+            sy = float(throw_state["y"])
+        elif path_points:
+            sx, sy = path_points[0]
+
+        if path_points:
+            path_points[0] = [sx, sy]
+            path_points[-1] = [ex, ey]
+
+        dedup_key = (thrower, gtype, tick, detonate_tick)
+        if dedup_key in seen_grenade_keys:
+            continue
+        seen_grenade_keys.add(dedup_key)
 
         grenades_out.append(
             {
@@ -972,6 +1201,9 @@ def replay_round(demo_id: str, round_num: int):
         if x in (None, "") or y in (None, ""):
             continue
         yaw_raw = sh.get("yaw")
+        weapon = str(sh.get("weapon") or "")
+        if not _is_bullet_weapon(weapon):
+            continue
         shots_out.append(
             {
                 "tick": tick,
@@ -980,7 +1212,7 @@ def replay_round(demo_id: str, round_num: int):
                 "yaw": _safe(yaw_raw) if yaw_raw not in (None, "") else None,
                 "shooter": str(sh.get("shooter_name") or ""),
                 "side": str(sh.get("shooter_side") or ""),
-                "weapon": str(sh.get("weapon") or ""),
+                "weapon": weapon,
             }
         )
     shots_out.sort(key=lambda x: x.get("tick", 0))
@@ -1041,6 +1273,7 @@ def replay_round(demo_id: str, round_num: int):
         "effects": effects_out,
         "round_bounds": [round_tick_min, round_tick_max],
         "tick_range": [frame_ticks[0], frame_ticks[-1]],
+        "duration_s": round((round_tick_max - round_tick_min) / 64.0, 2),
         "frame_count": len(frames),
     }
 @app.post("/api/demo/{demo_id}/coaching/{player_name:path}")

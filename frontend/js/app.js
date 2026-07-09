@@ -294,6 +294,10 @@ const uploadZone = $('#upload-zone');
 const fileInput  = $('#file-input');
 
 $('#btn-browse').addEventListener('click', () => fileInput.click());
+$('#btn-topbar-analyze')?.addEventListener('click', () => {
+  navigateTo('upload');
+  fileInput.click();
+});
 fileInput.addEventListener('change', () => { if (fileInput.files[0]) startUpload(fileInput.files[0]); });
 
 uploadZone.addEventListener('click', () => fileInput.click());
@@ -352,6 +356,17 @@ function resetDemoScopedState() {
   if (scrubMarkers) scrubMarkers.innerHTML = '';
   const frameCounter = $('#rp-frame-counter');
   if (frameCounter) frameCounter.textContent = '0 / 0';
+  const replayToggles = [
+    ['rp-trails', true],
+    ['rp-labels', true],
+    ['rp-tracers', true],
+    ['rp-effects', true],
+    ['rp-zones', false],
+  ];
+  replayToggles.forEach(([id, checked]) => {
+    const input = $(`#${id}`);
+    if (input) input.checked = checked;
+  });
 
   const alivePanel = $('#alive-panel');
   if (alivePanel) alivePanel.innerHTML = '';
@@ -1832,6 +1847,11 @@ async function loadReplayRound(roundNum) {
 
     const canvas = $('#replay-canvas');
     replayEngine = new ReplayEngine(canvas, data, State.radarUrl);
+    replayEngine.setTrails($('#rp-trails')?.checked ?? true);
+    replayEngine.setLabels($('#rp-labels')?.checked ?? true);
+    replayEngine.setTracers($('#rp-tracers')?.checked ?? true);
+    replayEngine.setEffects($('#rp-effects')?.checked ?? true);
+    replayEngine.setZones($('#rp-zones')?.checked ?? false);
 
     replayEngine.onFrameChange = (idx, total) => {
       $('#rp-scrubber').max   = total - 1;
@@ -1992,6 +2012,12 @@ $('#rp-scrubber').addEventListener('input',  (e) => replayEngine?.seekTo(parseIn
 $('#rp-speed').addEventListener('change',    (e) => replayEngine?.setSpeed(parseFloat(e.target.value)));
 $('#rp-trails').addEventListener('change',   (e) => replayEngine?.setTrails(e.target.checked));
 $('#rp-labels').addEventListener('change',   (e) => replayEngine?.setLabels(e.target.checked));
+$('#rp-tracers').addEventListener('change',  (e) => replayEngine?.setTracers(e.target.checked));
+$('#rp-effects').addEventListener('change',  (e) => replayEngine?.setEffects(e.target.checked));
+$('#rp-zones').addEventListener('change',    (e) => replayEngine?.setZones(e.target.checked));
+$('#rp-zoom-in')?.addEventListener('click',  () => replayEngine?.zoomIn());
+$('#rp-zoom-out')?.addEventListener('click', () => replayEngine?.zoomOut());
+$('#rp-zoom-reset')?.addEventListener('click', () => replayEngine?.resetView());
 
 // â”€â”€ Coaching view â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 function renderCoachingView() {

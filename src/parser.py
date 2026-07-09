@@ -7,12 +7,32 @@ awpy 2.x API'sine gÃ¶re yazÄ±lmÄ±ÅŸtÄ±r.
 from awpy import Demo
 import pandas as pd
 import json
+import sys
+import builtins
 from pathlib import Path
 
 
 # Ekstra oyuncu alanlari — tick verisine yaw/armor/silah/kit bilgisi ekler.
 # awpy 2.x bunlari ancak player_props ile parse edilirse cikarir.
 PLAYER_PROPS = ["yaw", "armor_value", "active_weapon_name", "has_defuser", "has_helmet"]
+
+
+def _safe_print(*args, **kwargs):
+    """Print without crashing on cp1254/cp1252 consoles when player names contain Unicode."""
+    try:
+        return builtins.print(*args, **kwargs)
+    except UnicodeEncodeError:
+        file = kwargs.get("file", sys.stdout)
+        sep = kwargs.get("sep", " ")
+        end = kwargs.get("end", "\n")
+        flush = kwargs.get("flush", False)
+        encoding = getattr(file, "encoding", None) or "utf-8"
+        text = sep.join(str(arg) for arg in args)
+        safe_text = text.encode(encoding, errors="replace").decode(encoding, errors="replace")
+        return builtins.print(safe_text, end=end, file=file, flush=flush)
+
+
+print = _safe_print
 
 
 def parse_demo(demo_path: str) -> dict:
@@ -114,7 +134,7 @@ def parse_demo(demo_path: str) -> dict:
     _enrich_shots_with_yaw(shots, player_positions)
 
     result = {
-        "schema_version": 11,
+        "schema_version": 12,
         "map":          map_name,
         "total_rounds": total_rounds,
         "map_bounds":   _extract_map_bounds(ticks_df),
@@ -738,6 +758,8 @@ def _process_grenades(df: pd.DataFrame) -> list:
             col_map[5] = "nade_y"
         if 6 in df.columns:
             col_map[6] = "nade_z"
+        if 7 in df.columns:
+            col_map[7] = "entity_id"
         df = df.rename(columns=col_map)
     else:
         # Named columns â€” try common aliases
@@ -756,6 +778,8 @@ def _process_grenades(df: pd.DataFrame) -> list:
                 rename_map[col] = "nade_y"
             elif cl in ("z", "nade_z"):
                 rename_map[col] = "nade_z"
+            elif cl in ("entity_id", "entityid", "entity"):
+                rename_map[col] = "entity_id"
             elif cl in ("round", "round_num"):
                 rename_map[col] = "round_num"
         if rename_map:
@@ -776,11 +800,53 @@ def _process_grenades(df: pd.DataFrame) -> list:
         df = df[df["tick"] > 0]
     if "round_num" in df.columns:
         df["round_num"] = pd.to_numeric(df["round_num"], errors="coerce")
+    if "entity_id" in df.columns:
+        df["entity_id"] = pd.to_numeric(df["entity_id"], errors="coerce")
 
-    # Deduplikasyon: AynÄ± oyuncu + aynÄ± tip iÃ§in ardÄ±ÅŸÄ±k tick'leri (gap < 64) tek atÄ±ÅŸ say
+    # Entity id varsa her projectile'i ayrı ele al. Sadece oyuncu+tip+gap ile
+    # gruplamak flashlarda stale/NaN entity stream'lerini gerçek path'e karıştırır.
     df = df.sort_values("tick") if "tick" in df.columns else df
 
     throws = []
+    if "entity_id" in df.columns:
+        entity_df = df.dropna(subset=["entity_id"]).copy()
+        if not entity_df.empty:
+            group_cols = ["thrower_name", "grenade_type", "entity_id"]
+            if "round_num" in entity_df.columns:
+                group_cols.insert(2, "round_num")
+            for keys, group in entity_df.groupby(group_cols, dropna=True):
+                if not isinstance(keys, tuple):
+                    keys = (keys,)
+                key_map = dict(zip(group_cols, keys))
+                player = key_map.get("thrower_name")
+                gtype = key_map.get("grenade_type")
+                entry = {
+                    "thrower_name": player,
+                    "grenade_type": gtype,
+                    "entity_id": int(float(key_map.get("entity_id"))),
+                    "tick": int(group["tick"].min()) if "tick" in group.columns else 0,
+                }
+                if "round_num" in key_map:
+                    entry["round_num"] = int(float(key_map["round_num"]))
+                _add_grenade_coords(entry, group)
+                # awpy can keep stale projectile entities alive with no usable
+                # coordinates; those should not become replay throws.
+                if "nade_x" not in entry or "nade_y" not in entry:
+                    continue
+                if entry.get("nade_first_tick"):
+                    entry["tick"] = int(entry["nade_first_tick"])
+                throws.append(entry)
+
+            if throws:
+                throws.sort(key=lambda t: int(t.get("tick", 0)))
+                print(f"[+] Grenade throws (entity grouped): {len(throws)}")
+                from collections import Counter
+                type_counts = Counter(t["grenade_type"] for t in throws)
+                print(f"[+] Grenade type daÄŸÄ±lÄ±mÄ±: {dict(type_counts)}")
+                return throws
+
+    # Entity id yoksa fallback: Aynı oyuncu + aynı tip için ardışık tick'leri
+    # (gap < 64) tek atış say.
     grouped = df.groupby(["thrower_name", "grenade_type"])
     for (player, gtype), group in grouped:
         if "tick" not in group.columns:
@@ -835,7 +901,11 @@ def _add_grenade_coords(entry: dict, rows: pd.DataFrame):
     with_coords = rows.copy()
     with_coords["nade_x"] = pd.to_numeric(with_coords["nade_x"], errors="coerce")
     with_coords["nade_y"] = pd.to_numeric(with_coords["nade_y"], errors="coerce")
+    if "tick" in with_coords.columns:
+        with_coords["tick"] = pd.to_numeric(with_coords["tick"], errors="coerce")
     with_coords = with_coords.dropna(subset=["nade_x", "nade_y"])
+    if "tick" in with_coords.columns:
+        with_coords = with_coords.sort_values("tick")
 
     if with_coords.empty:
         return
@@ -845,11 +915,17 @@ def _add_grenade_coords(entry: dict, rows: pd.DataFrame):
 
     # Projectile tick noktalarÄ±ndan rota Ã§Ä±kar (tekrarlayan noktalarÄ± sadeleÅŸtir).
     path_points = []
+    path_ticks = []
     for _, r in with_coords.iterrows():
         x = float(r["nade_x"])
         y = float(r["nade_y"])
         if not path_points or path_points[-1][0] != x or path_points[-1][1] != y:
             path_points.append([x, y])
+            if "tick" in with_coords.columns:
+                try:
+                    path_ticks.append(int(float(r["tick"])))
+                except (TypeError, ValueError):
+                    pass
 
     try:
         start_x = float(first["nade_x"])
@@ -864,8 +940,13 @@ def _add_grenade_coords(entry: dict, rows: pd.DataFrame):
         entry["nade_start_y"] = start_y
         entry["nade_end_x"] = end_x
         entry["nade_end_y"] = end_y
+        if "tick" in with_coords.columns:
+            entry["nade_first_tick"] = int(float(first["tick"]))
+            entry["nade_last_tick"] = int(float(last["tick"]))
         if len(path_points) >= 2:
             entry["nade_path"] = path_points
+            if len(path_ticks) == len(path_points):
+                entry["nade_path_ticks"] = path_ticks
     except (ValueError, TypeError):
         pass
 

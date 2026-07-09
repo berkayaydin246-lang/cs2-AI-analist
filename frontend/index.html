@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>CS2 AI Coach</title>
+  <title>CALLOUT | CS2 Analytics</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="/static/css/style.css" />
@@ -14,8 +14,8 @@
   <!-- ── Sidebar ─────────────────────────────────────────────────────────── -->
   <aside id="sidebar">
     <div class="sidebar-logo">
-      <span class="logo-icon">CS</span>
-      <span class="logo-text">CS2 Coach</span>
+      <span class="logo-icon" aria-hidden="true"></span>
+      <span class="logo-text">CALLOUT</span>
     </div>
 
     <div id="demo-meta" class="demo-meta hidden">
@@ -51,12 +51,32 @@
     </nav>
 
     <div class="sidebar-footer">
-      <span class="version-badge">v1.0</span>
+      <span class="version-kicker">DEMO DATA SOURCE</span>
+      <span class="version-badge">Local parser + Steam API</span>
     </div>
   </aside>
 
   <!-- ── Main content ───────────────────────────────────────────────────── -->
   <main id="main">
+    <header id="topbar">
+      <div class="topbar-search">
+        <span class="topbar-search-icon" aria-hidden="true"></span>
+        <input type="search" placeholder="Search player, team, or match ID..." aria-label="Search player, team, or match ID" />
+      </div>
+      <div class="topbar-spacer"></div>
+      <div class="topbar-status">
+        <span class="topbar-status-dot"></span>
+        <span>Parser + Steam Connected</span>
+      </div>
+      <button class="topbar-primary" type="button" id="btn-topbar-analyze">Analyze Match</button>
+      <button class="topbar-icon-btn" type="button" title="Notifications" aria-label="Notifications">
+        <span class="topbar-bell" aria-hidden="true"></span>
+      </button>
+      <div class="topbar-user" title="Local workspace">
+        <span class="topbar-avatar">CS</span>
+        <span class="topbar-user-name">analyst</span>
+      </div>
+    </header>
 
     <!-- ── UPLOAD VIEW ───────────────────────────────────────────────────── -->
     <div class="view active" id="view-upload">
@@ -138,7 +158,12 @@
         <!-- Canvas + controls -->
         <div class="replay-main">
           <div class="replay-canvas-wrapper">
-            <canvas id="replay-canvas" width="600" height="600"></canvas>
+            <canvas id="replay-canvas" width="1024" height="1024"></canvas>
+            <div class="replay-zoom-controls" aria-label="Replay zoom controls">
+              <button class="replay-zoom-btn" id="rp-zoom-in" title="Zoom in">+</button>
+              <button class="replay-zoom-btn" id="rp-zoom-out" title="Zoom out">-</button>
+              <button class="replay-zoom-btn replay-zoom-reset" id="rp-zoom-reset" title="Reset zoom">1:1</button>
+            </div>
             <div id="replay-loading-overlay" class="replay-loading hidden">
               <div class="spinner"></div>
               <span>Loading round data...</span>
@@ -162,6 +187,7 @@
             </div>
             <span class="replay-frame-counter" id="rp-frame-counter">0 / 0</span>
             <select id="rp-speed" class="replay-select">
+              <option value="0.25">0.25x</option>
               <option value="0.5">0.5x</option>
               <option value="1" selected>1x</option>
               <option value="2">2x</option>
@@ -172,6 +198,15 @@
             </label>
             <label class="replay-toggle-label">
               <input type="checkbox" id="rp-labels" checked /> Labels
+            </label>
+            <label class="replay-toggle-label">
+              <input type="checkbox" id="rp-tracers" checked /> Tracers
+            </label>
+            <label class="replay-toggle-label">
+              <input type="checkbox" id="rp-effects" checked /> Effects
+            </label>
+            <label class="replay-toggle-label">
+              <input type="checkbox" id="rp-zones" /> Zones
             </label>
           </div>
         </div>

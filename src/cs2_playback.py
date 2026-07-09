@@ -217,8 +217,18 @@ class PlaybackController:
             self._emit_playback_event(f"state -> {state}", reason=reason)
 
     @staticmethod
+    def _console_text(raw: Any) -> str:
+        if raw is None:
+            return ""
+        if isinstance(raw, str):
+            return raw
+        if isinstance(raw, bytes):
+            return raw.decode("utf-8", errors="replace")
+        return ""
+
+    @staticmethod
     def _extract_numeric_demo_timescale(command: str, raw: str) -> float | None:
-        text = (raw or "").strip()
+        text = PlaybackController._console_text(raw).strip()
         if not text:
             return None
         lowered = text.lower()
@@ -240,7 +250,7 @@ class PlaybackController:
 
     @staticmethod
     def _extract_paused_tick(raw: str) -> int | None:
-        match = _PAUSED_TICK_RE.search(raw or "")
+        match = _PAUSED_TICK_RE.search(PlaybackController._console_text(raw))
         if not match:
             return None
         try:
@@ -249,7 +259,7 @@ class PlaybackController:
             return None
 
     def _inspect_playback_response(self, command: str, raw: str) -> dict[str, Any]:
-        text = raw or ""
+        text = self._console_text(raw)
         lowered = text.lower()
         queue_detected = _DEMO_QUEUE_PLAYING_TOKEN in lowered
         playing_detected = _DEMO_PLAYING_TOKEN in lowered
@@ -581,7 +591,7 @@ class PlaybackController:
             return paused_tick
         self._emit_playback_event(
             "pre-seek anchor pause missing tick",
-            raw=(pause_response or "").strip()[:200],
+            raw=self._console_text(pause_response).strip()[:200],
         )
         return None
 
@@ -1488,12 +1498,13 @@ class PlaybackController:
                 raw = self.cs2.exec_command(cmd)
             except CS2ControlError as e:
                 return {"ok": False, "failed_command": cmd, "error": str(e), "details": details}
-            lowered = (raw or "").lower()
-            if not (raw or "").strip() and not allow_empty:
+            text = self._console_text(raw)
+            lowered = text.lower()
+            if not text.strip() and not allow_empty:
                 return {"ok": False, "failed_command": cmd, "raw": "", "details": details}
             if any(token in lowered for token in _INVALID_PROBE_TOKENS):
-                return {"ok": False, "failed_command": cmd, "raw": raw.strip(), "details": details}
-            details.append({"command": cmd, "raw": (raw or "").strip()[:200]})
+                return {"ok": False, "failed_command": cmd, "raw": text.strip(), "details": details}
+            details.append({"command": cmd, "raw": text.strip()[:200]})
         return {"ok": True, "details": details}
 
     def _wait_for_stable_probe(
@@ -1533,6 +1544,41 @@ class PlaybackController:
             f"{label} did not stabilize within {timeout_s:.1f}s"
             + (f": {last_probe.get('error')}" if last_probe.get("error") else "")
         )
+
+    def _wait_for_stable_probe_with_fallback(
+        self,
+        *,
+        label: str,
+        timeout_s: float,
+        commands: list[str] | None = None,
+        interval_s: float = 0.35,
+        consecutive_successes: int = 2,
+    ) -> dict[str, Any]:
+        warnings: list[str] = []
+        try:
+            probe = self._wait_for_stable_probe(
+                label,
+                timeout_s=timeout_s,
+                interval_s=interval_s,
+                consecutive_successes=consecutive_successes,
+                commands=commands,
+                allow_empty=False,
+            )
+            return {"probe": probe, "probe_strength": "strong", "warnings": warnings}
+        except PlaybackError as e:
+            warning = f"{label} strong probe failed; falling back to weak probe: {e}"
+            warnings.append(warning)
+            self._emit_playback_event("probe fallback engaged", label=label, warning=warning)
+
+        probe = self._wait_for_stable_probe(
+            f"{label}_fallback",
+            timeout_s=timeout_s,
+            interval_s=interval_s,
+            consecutive_successes=consecutive_successes,
+            commands=commands,
+            allow_empty=True,
+        )
+        return {"probe": probe, "probe_strength": "weak", "warnings": warnings}
 
     def _effective_seek_timeout_s(self) -> float:
         """Use the backend-specific seek timeout when available.
@@ -1691,42 +1737,68 @@ class PlaybackController:
         result.steps.append(step)
 
     def _step_wait_for_load(self, result: PlaybackResult) -> None:
-        step = {"step": "wait_for_load"}
+        step = {"step": "wait_for_load", "warnings": []}
         timeout_s = self._effective_load_timeout_s()
         log.info(f"Polling for demo load readiness (timeout={timeout_s:.1f}s)...")
         self._emit_playback_event("waiting for demo playback confirmation", timeout_s=timeout_s)
         time.sleep(1.25)
-        settled = self._poll_playback_runtime(
+        probe_summary = self._wait_for_stable_probe_with_fallback(
+            label="demo_load",
+            timeout_s=timeout_s,
             commands=["demo_timescale", "spec_mode"],
             interval_s=0.45,
-            timeout_s=timeout_s,
-            accept_states={PLAYBACK_PLAYING, PLAYBACK_PAUSED_READY},
-            result=result,
-            label="demo_load",
-            extend_on_progress=True,
-            progress_grace_s=6.0,
-            max_extensions=2,
-            require_positive_signal=True,
         )
+        if result.playback_state not in {PLAYBACK_PLAYING, PLAYBACK_PAUSED_READY}:
+            self._set_playback_state(result, PLAYBACK_PLAYING, reason=f"demo_load_probe_{probe_summary['probe_strength']}")
         step["status"] = "ok"
         step["timeout_s"] = timeout_s
-        step["attempts"] = settled["attempts"]
-        step["playback_state"] = settled["state"]
-        step["probe"] = {"ok": True, "details": settled["details"]}
-        step["elapsed_s"] = settled.get("elapsed_s")
-        step["last_progress_signal"] = settled.get("last_progress_signal", "")
-        step["last_positive_signal"] = settled.get("last_positive_signal", "")
-        step["last_negative_signal"] = settled.get("last_negative_signal", "")
-        step["extensions_used"] = settled.get("extensions_used", 0)
+        step["attempts"] = probe_summary["probe"].get("attempts", 0)
+        step["playback_state"] = result.playback_state
+        step["probe"] = probe_summary["probe"].get("last_probe", {"ok": True, "details": []})
+        step["probe_strength"] = probe_summary["probe_strength"]
+        step["warnings"].extend(probe_summary["warnings"])
+        result.warnings.extend(probe_summary["warnings"])
         result.steps.append(step)
 
     def _step_seek(self, request: PlaybackRequest, result: PlaybackResult) -> None:
-        step = {"step": "seek"}
+        step = {"step": "seek", "warnings": []}
         seek_timeout_s = self._effective_seek_timeout_s()
         seek_tick = request.start_tick
+        if self._playback_state == PLAYBACK_PAUSED_READY:
+            self.cs2.resume_demo()
+            time.sleep(0.25)
+            self._set_playback_state(result, PLAYBACK_PLAYING, reason="seek_resume_from_paused_ready")
         if self._playback_state != PLAYBACK_PLAYING:
-            result.failure_code = "seek_failure"
-            raise PlaybackError(f"Cannot seek while playback_state={self._playback_state}")
+            warning = f"seek entered with playback_state={self._playback_state}; using compatibility probe fallback"
+            step["warnings"].append(warning)
+            try:
+                self.cs2.seek_to_tick(seek_tick)
+                probe_summary = self._wait_for_stable_probe_with_fallback(
+                    label="seek",
+                    timeout_s=seek_timeout_s,
+                    commands=["demo_timescale", "spec_mode"],
+                    interval_s=0.35,
+                )
+            except (PlaybackError, CS2ControlError) as e:
+                self._set_playback_state(result, PLAYBACK_SEEK_FAILED, reason="seek_failure")
+                step["status"] = "failed"
+                step["error"] = str(e)
+                result.failure_code = "seek_failure"
+                result.steps.append(step)
+                raise PlaybackError(str(e))
+            result.actual_seek_tick = seek_tick
+            self._set_playback_state(result, PLAYBACK_PLAYING, reason=f"seek_probe_{probe_summary['probe_strength']}")
+            step["status"] = "ok"
+            step["seek_tick"] = seek_tick
+            step["timeout_s"] = seek_timeout_s
+            step["attempts"] = probe_summary["probe"].get("attempts", 0)
+            step["playback_state"] = result.playback_state
+            step["probe"] = probe_summary["probe"].get("last_probe", {"ok": True, "details": []})
+            step["probe_strength"] = probe_summary["probe_strength"]
+            step["warnings"].extend(probe_summary["warnings"])
+            result.warnings.extend(step["warnings"])
+            result.steps.append(step)
+            return
 
         pre_seek = self._step_pre_seek_settle(result, seek_tick)
         step["pre_seek_settle"] = {
